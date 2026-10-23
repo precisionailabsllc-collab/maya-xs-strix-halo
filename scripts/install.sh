@@ -3,7 +3,7 @@
 set -eu
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(dirname "$here")"
-for f in "$here"/*.py "$here"/*.sh "$root"/config/*.service; do
+for f in "$here"/*.py "$here"/*.sh "$root"/config/*.service "$root"/config/*.json; do
     [ -f "$f" ] || continue
     [ "$(basename "$f")" = "install.sh" ] && continue
     sed -i "s|{{HOME}}|$HOME|g" "$f"

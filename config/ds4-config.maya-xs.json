@@ -1,9 +1,9 @@
 {
  "_": "maya-ds4: DeepSeek-V4.1-Flash-1017 Maya-S on the Strix Halo APU (gfx1151). Read by serve/server.py --engine strata, which runs `<exe> --serve <args>`.",
- "exe": "/home/rj/.local/opt/project-maya-trial/upstream-update-20261020/build/maya-ds4",
+ "exe": "{{HOME}}/.local/opt/maya/build-hip/maya-ds4",
  "args": [
   "--pack",
-  "/home/rj/models/DeepSeek-V4.1-Flash-1017-Maya-GGUF/Maya-XS/maya-ds4",
+  "{{HOME}}/models/DeepSeek-V4.1-Flash-1017-Maya-GGUF/Maya-XS/maya-ds4",
   "--max-context",
   "65536",
   "--reserve-mib",
@@ -29,9 +29,9 @@
   "DS4_PREFIX_STRIDE": "8192",
   "MAYA_DS4_Q8_BATCH": "1"
  },
- "cwd": "/home/rj/.local/opt/project-maya-trial/upstream-update-20261020/build",
- "tokenizer": "/home/rj/models/DeepSeek-V4.1-Flash-1017-Maya-GGUF/Maya-XS/maya-ds4/tokenizer",
+ "cwd": "{{HOME}}/.local/opt/maya/build-hip",
+ "tokenizer": "{{HOME}}/models/DeepSeek-V4.1-Flash-1017-Maya-GGUF/Maya-XS/maya-ds4/tokenizer",
  "model_name": "deepseek-v4.1-flash-1017-maya-s",
  "backend": "hip",
- "log": "/home/rj/.local/state/maya-ds4/engine.log"
+ "log": "{{HOME}}/.local/state/maya-ds4/engine.log"
 }
