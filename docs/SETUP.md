@@ -88,8 +88,8 @@ Start from *total RAM minus 115.4 GB minus 5 GB*, then verify.
 by hand or install the unit:
 
 ```sh
-cp config/maya-ds4.service ~/.config/systemd/user/
-sed -i "s|/home/rj|$HOME|g" ~/.config/systemd/user/maya-ds4.service
+cd scripts && ./install.sh          # rewrites {{HOME}} in the scripts and the unit
+cp ../config/maya-ds4.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user start maya-ds4
 curl -s localhost:17866/health
 ```

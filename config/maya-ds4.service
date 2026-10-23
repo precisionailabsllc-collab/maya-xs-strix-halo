@@ -1,6 +1,6 @@
 [Unit]
 Description=Maya DS4 - DeepSeek-V4.1-Flash-1017 (Maya-S) local inference server
-Documentation=file:///home/rj/.local/opt/maya-ds4/README.md
+Documentation=https://github.com/precisionailabsllc-collab/maya-xs-strix-halo
 After=network-online.target
 Wants=network-online.target
 
@@ -8,9 +8,9 @@ Wants=network-online.target
 Type=simple
 User=rj
 Group=rj
-WorkingDirectory=/home/rj/.local/opt/project-maya-trial/upstream-update-20261020/source
-Environment=HOME=/home/rj
-Environment=PATH=/home/rj/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory={{HOME}}/.local/opt/project-maya-trial/upstream-update-20261020/source
+Environment=HOME={{HOME}}
+Environment=PATH={{HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
 # keep earlier turns' reasoning in the prompt so a turn continues the previous state: without it the
 # reference encoder rewrites the history every turn and neither prefix reuse nor the kept conversations
@@ -39,9 +39,9 @@ RestartSec=15
 TimeoutStopSec=120
 KillMode=mixed
 
-ExecStart=/home/rj/.local/opt/maya-ds4/venv/bin/python serve/server.py \
+ExecStart={{HOME}}/.local/opt/maya-ds4/venv/bin/python serve/server.py \
     --engine strata \
-    --config /home/rj/.local/opt/maya-ds4/ds4-config.json \
+    --config {{HOME}}/.local/opt/maya-ds4/ds4-config.json \
     --host 127.0.0.1 \
     --port 17866
 
