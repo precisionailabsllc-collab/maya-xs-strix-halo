@@ -1,49 +1,46 @@
 [Unit]
-Description=Maya DS4 - DeepSeek-V4.1-Flash-1017 (Maya-S) local inference server
+Description=Maya DS4 - DeepSeek-V4.1-Flash Maya-XS local inference server (Project Maya engine)
 Documentation=https://github.com/precisionailabsllc-collab/maya-xs-strix-halo
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=rj
-Group=rj
-WorkingDirectory={{HOME}}/.local/opt/project-maya-trial/upstream-update-20261020/source
+# A systemd --user unit runs as you; paths below are rewritten by scripts/install.sh.
+WorkingDirectory={{HOME}}/maya
 Environment=HOME={{HOME}}
 Environment=PATH={{HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
-# keep earlier turns' reasoning in the prompt so a turn continues the previous state: without it the
+# Keep earlier turns' reasoning in the rendered prompt, so a turn continues the previous state. Without it the
 # reference encoder rewrites the history every turn and neither prefix reuse nor the kept conversations
-# (MAYA_DS4_SLOT_KEEP) can hit - every turn then re-reads its whole prompt (measured: 19.3 s -> 2.7 s)
+# (MAYA_DS4_SLOT_KEEP) can hit - every turn then re-reads its whole prompt (measured: 19.3 s -> 2.7 s).
+# NOTE: the client must send reasoning_content back for this to work; see docs/SETUP.md section 5.
 Environment=MAYA_DS4_KEEP_THINKING=1
 
-# The engine pins host staging buffers for the expert DMA (GBs of flow rings and bounce buffers,
-# not MBs) and, on this APU, pinned host memory comes out of the same GTT window as the GPU pool.
-# Unlimited is the safe setting. Measured 2026-10-20: HIP's host allocations are NOT gated by
-# memlock (17 MiB pins fine under the default 8 MiB), so this is insurance rather than the fix -
-# the real ceiling is the GTT window, which DS4_POOL_GB and DS4_RING_MB keep under.
+# The engine pins host staging buffers for the expert DMA (GBs of flow rings and bounce buffers, not MBs) and, on
+# an APU, pinned host memory comes out of the same GTT window as the GPU pool. Unlimited is the safe setting.
 LimitMEMLOCK=infinity
 
-# Loading reads ~108 GB of experts ahead and fills the GPU pool (DS4_POOL_GB=50): give it
-# time, and count its memory so the journal shows what it holds.
+# Loading reads the expert set ahead and fills the GPU pool: give it time, and account its memory so the journal
+# shows what it holds.
 TimeoutStartSec=infinity
 MemoryAccounting=yes
-# The pool is anonymous memory and cannot be reclaimed; the page cache beside it can. Hold the
-# service high enough that the kernel reclaims cache rather than reaching for the desktop.
+# The pool is anonymous memory and cannot be reclaimed; the page cache beside it can. Hold the service high enough
+# that the kernel reclaims cache rather than reaching for the desktop. Tune to your box: pool + dense weights + a
+# few GB for the rest (this value suits DS4_POOL_GB=100 on a 128 GB machine).
 MemoryHigh=108G
 
-# The engine exits non-zero if the GPU pool or a shard is unusable; retry, but do not
-# hammer a broken install.
+# The engine exits non-zero if the GPU pool or a shard is unusable; retry, but do not hammer a broken install.
 Restart=on-failure
 RestartSec=15
 TimeoutStopSec=120
 KillMode=mixed
 
-ExecStart={{HOME}}/.local/opt/maya-ds4/venv/bin/python serve/server.py \
+ExecStart={{HOME}}/maya/.venv/bin/python serve/server.py \
     --engine strata \
-    --config {{HOME}}/.local/opt/maya-ds4/ds4-config.json \
+    --config {{HOME}}/maya/ds4-config.json \
     --host 127.0.0.1 \
     --port 17866
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

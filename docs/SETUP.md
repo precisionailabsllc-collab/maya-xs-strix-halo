@@ -33,7 +33,12 @@ git am /path/to/patches/*.patch          # 9 patches: prefix reuse, pool sizing,
 cmake -G Ninja -B build-hip -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_HIP_ARCHITECTURES=gfx1151 -DSTRATA_ENABLE_HIP=ON -DSTRATA_PREFILL_MMQ=ON
 cmake --build build-hip -j8 --target maya-ds4
+python3 -m venv ~/maya/.venv                     # the server's own dependencies
+~/maya/.venv/bin/pip install -r requirements.txt 2>/dev/null || true
 ```
+
+The unit expects the clone at `~/maya` and the server's Python at `~/maya/.venv/bin/python`; adjust the unit if
+you keep it elsewhere.
 
 Two notes from doing this on the reference machine:
 
@@ -88,7 +93,8 @@ Start from *total RAM minus 115.4 GB minus 5 GB*, then verify.
 by hand or install the unit:
 
 ```sh
-cd scripts && ./install.sh          # rewrites {{HOME}} in the scripts and the unit
+cp config/ds4-config.maya-xs.json ~/maya/ds4-config.json    # then edit the paths inside it
+cd scripts && ./install.sh                                  # rewrites {{HOME}} in scripts + unit + configs
 cp ../config/maya-ds4.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user start maya-ds4
 curl -s localhost:17866/health
