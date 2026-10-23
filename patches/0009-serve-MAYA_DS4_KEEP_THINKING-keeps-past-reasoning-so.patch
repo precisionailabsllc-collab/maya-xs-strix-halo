@@ -1,0 +1,51 @@
+From 2c8f08d1e282d0f6bb74f82bb12f6e6109616f2f Mon Sep 17 00:00:00 2001
+From: Hermes <rj@hermes.local>
+Date: Thu, 22 Oct 2026 08:00:46 -0400
+Subject: [PATCH 9/9] serve: MAYA_DS4_KEEP_THINKING keeps past reasoning, so a
+ conversation can continue
+
+The pinned reference encoder drops the earlier turns' reasoning_content by default (as DeepSeek's own
+serving does, to keep prompts short). Through the server that makes every turn render a different history,
+so no turn continues the previous turn's state and neither prefix reuse nor the kept conversations
+(MAYA_DS4_SLOT_KEEP / PR #356) can hit: a 4,215-token follow-up arrived with a 4,197-token state in front
+of it that it did not contain, and re-read all of it every turn.
+
+MAYA_DS4_KEEP_THINKING=1 passes drop_thinking=False. Measured on an interleaved A1/B1/A2/B2 with the slots
+on: A2 reused 4197 and read 18 tokens, prefill 19.3 s -> 2.7 s (B2: 19.0 s -> 1.9 s). It needs the client
+to echo reasoning_content back; with only content, reuse silently returns to 0.
+
+(cherry picked from commit dcf9cee076b090e6b91d12b4a8afc5fb49de663a)
+---
+ serve/frontend.py | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/serve/frontend.py b/serve/frontend.py
+index 85cb11f..03bd495 100644
+--- a/serve/frontend.py
++++ b/serve/frontend.py
+@@ -16,6 +16,7 @@ and the formats change often; the engine boundary is token ids in, text deltas o
+ """
+ from __future__ import annotations
+ 
++import os
+ import json
+ import copy
+ import re
+@@ -69,8 +70,16 @@ class ChatTemplate:
+                 history[0]["tools"] = schemas
+             options = deepseek_effort_kwargs(kwargs.get("reasoning_effort"))
+             thinking = kwargs.get("enable_thinking") is not False and options.get("enable_thinking") is not False
++            # MAYA_DS4_KEEP_THINKING=1: keep the earlier turns' reasoning in the rendered prompt. The reference
++            # encoder drops it by default, as DeepSeek's own serving does to save tokens - but a rewritten
++            # history means no turn ever continues the previous turn's state, so neither prefix reuse nor the
++            # kept conversations (MAYA_DS4_SLOT_KEEP) can hit, and every turn re-reads its whole prompt. With
++            # this on, a growing conversation is continued: only the new tokens are read. The tokens it adds
++            # are ones the engine already has in the state, so they cost reuse, not a read.
++            keep_thinking = os.environ.get("MAYA_DS4_KEEP_THINKING") == "1"
+             prompt = encode_messages(history, thinking_mode="thinking" if thinking else "chat",
+-                                     reasoning_effort=options.get("reasoning_effort"))
++                                     reasoning_effort=options.get("reasoning_effort"),
++                                     drop_thinking=not keep_thinking)
+             # The reference encoder always opens a generation turn after a user,
+             # tool result or late system message. Expose Jinja's opt-out without
+             # changing the pinned encoder or removing explicit task tokens.

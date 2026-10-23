@@ -1,0 +1,45 @@
+From ad42318e91bbca8ad538c285a79f98c9cb03fcbb Mon Sep 17 00:00:00 2001
+From: OpenCode <rj@precisionailabs.com>
+Date: Tue, 20 Oct 2026 17:42:37 -0400
+Subject: [PATCH 2/9] ds4: read the CPU lane's experts ahead coldest first, the
+ hottest last
+
+The read-ahead fills the page cache with 'the most-routed N GB' in hottest-first
+order, but on a box whose cache is smaller than N - a 125 GB APU, where the GPU
+pool already took ~48 GB - the pages read first are the ones evicted first: a
+page read once sits on the inactive list, so an LRU cache keeps whatever was read
+last. The hottest experts were therefore the ones NOT cached, and a 2831-token
+prompt found 10.2 GB of its 63.8 GB of experts in the page cache before falling
+back to unbuffered reads off the disk (53.6 GB at 1.49 GB/s, 36 of the prompt's
+43 s).
+
+Reading the same set in reverse leaves the hottest experts resident instead. No
+change in bytes read or load time, only in what survives.
+
+(cherry picked from commit 597d7a27e8300bc1bdc6c175ba2131ac336b882b)
+(cherry picked from commit dfc601a18f82a49bc05dcb19c29653cf5ed63171)
+(cherry picked from commit 964a15833b767db0f3412886141acdf74355fe1a)
+---
+ src/ds4/ds4_model.cu | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/ds4/ds4_model.cu b/src/ds4/ds4_model.cu
+index 762fe79..dab13e1 100644
+--- a/src/ds4/ds4_model.cu
++++ b/src/ds4/ds4_model.cu
+@@ -4814,7 +4814,14 @@ struct Model::Impl {
+         for (int t = 0; t < 12 && nw > 0; ++t)
+             wt.emplace_back([&] {
+                 std::vector<uint8_t> buf(maxb);
+-                for (size_t i; (i = wi.fetch_add(1)) < nw;) read_mx(L[(size_t) warm[i].layer], warm[i].e, buf.data());
++                // (coldest first, the hottest last: the cache holds less than warm_bytes on a unified-memory box - the
++                //  pool took its share - and pages read once sit on the inactive list, so the ones that survive are
++                //  the ones read last. Reading hottest first left the coldest experts cached and the prompt found
++                //  10.2 GB of its 63.8 GB in the page cache.)
++                for (size_t k; (k = wi.fetch_add(1)) < nw;) {
++                    const size_t i = nw - 1 - k;
++                    read_mx(L[(size_t) warm[i].layer], warm[i].e, buf.data());
++                }
+             });
+         for (auto& t : wt) t.join();
+         if (o.verbose && nw > 0)

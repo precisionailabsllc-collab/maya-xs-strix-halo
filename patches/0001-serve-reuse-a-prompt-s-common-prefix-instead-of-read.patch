@@ -1,0 +1,224 @@
+From 10a4a10fcfe509e9b5a3f9da7ea95eedb2292b91 Mon Sep 17 00:00:00 2001
+From: rj <rj@hermes.local>
+Date: Wed, 21 Oct 2026 00:49:56 -0400
+Subject: [PATCH 1/9] serve: reuse a prompt's common prefix instead of reading
+ all of it again
+
+The engine took two checkpoints - the end of the last prompt and the position before its
+last token - which is exactly enough for "the next turn re-renders this one" and nothing
+else. Every other prompt, however slightly it diverged, reported 0 reused and paid for the
+whole read: a 13k prompt whose last sentence changed cost the same as one sharing nothing.
+
+Now prompt-path runs leave a checkpoint each, in a rotating ring of 14 slots above those two
+(kCheckpoints = 16), and a request restores the deepest one its prompt still shares. The
+marks sit on boundaries the run loop already has, so one costs a ~3 MB host copy and a
+stream sync - no read, no extra kernel.
+
+Measured on 13,029 tokens (one engine session per leg, this box):
+
+  full read, nothing shared                 186.6 s
+  the same prompt again (next turn)           0.1 s   13,028 reused
+  same 13k prefix, new last sentence         77.2 s   8,192 reused  2.4x
+  one sentence changed at 55%:
+    marks at chunk boundaries (8192)        203.7 s   nothing reusable
+    marks every 2048 tokens                 117.9 s   6,144 reused  1.7x
+
+Two things this needed:
+
+- Model::feed_chunk(), because feed_unit() returns max(chunk, max_context) - the whole
+  prompt - so the first version of this took no marks at all for any prompt under 64k and
+  reported reused=0 while looking healthy. serve cuts runs at the chunk size, or at
+  DS4_PREFIX_STRIDE when that is smaller.
+- A default run cap of 4096 tokens (DS4_PREFIX_STRIDE's default). A single feed of a whole
+  prompt is bimodal on a 13k prompt in a way that reads as a 40% slowdown: 187-191 s when
+  the page cache already held its experts, 318-328 s when it did not, always with "CPU lane
+  0.5% of the experts" - a few expert calls served from the CPU lane serialize a pipelined
+  chunk. Runs of 2048-4096 tokens measured 187-205 s in every state.
+
+The restore is exact: with --no-expert-cache, so that the engine itself reproduces a prompt
+bit for bit, a prompt restored from the 8192 mark produced logits bit-identical to reading
+it from scratch (max |diff| 0.0 over all 129,280 rows, same argmax). Note that the engine is
+not bit-reproducible with the expert cache on - up to ~1.8 logits for the same prompt with
+no reuse - so a logit comparison at that scale proves nothing either way.
+
+DS4_PREFIX_REUSE=0 restores the old behaviour exactly.
+
+(cherry picked from commit ffe1bc76d4edb61be4205b6d7760c372dc3a5f2a)
+(cherry picked from commit 78bbd7a6698cc789c6e705c4096b572fe1e1db34)
+(cherry picked from commit bb968d95ba3be4c0cb0dc66a8d75b58c0fe6658c)
+---
+ src/ds4/ds4_main.cpp  | 45 ++++++++++++++++++++++++++++++++++++++-----
+ src/ds4/ds4_model.cu  | 10 ++++++----
+ src/ds4/ds4_model.hpp | 15 +++++++++++++--
+ 3 files changed, 59 insertions(+), 11 deletions(-)
+
+diff --git a/src/ds4/ds4_main.cpp b/src/ds4/ds4_main.cpp
+index cb4019b..2215f3a 100644
+--- a/src/ds4/ds4_main.cpp
++++ b/src/ds4/ds4_main.cpp
+@@ -9,7 +9,8 @@
+ // <decode ms> <stop|length|cancel> <accepted> <offered> <reused> <hits> <lookups>` (the drafts; the decode's routed
+ // experts in VRAM / all); `STOP` ends a request early, `QUIT` the engine.  A prompt that
+ // continues the state (the conversation so far) reuses it; one that only shares the last prompt's start goes back to
+-// that prompt's end; anything else starts over.  `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures
++// that prompt's end, or to the last checkpoint mark before where the two part (DS4_PREFIX_REUSE=0: only the ends,
++// the older behaviour); anything else starts over.  `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures
+ // (the file: see read_pics); the state is shared only where the same picture sits at the same place.
+ #include "ds4_model.hpp"
+ #include "strata/platform/env_alias.hpp"
+@@ -466,21 +467,55 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
+         if (from > 0 && from < total) m.checkpoint(1);
+         m.set_cancel([&in] { return in.stop.load(); });
+         bool stopped = false;
++        // A prompt's runs leave a checkpoint mark each (DS4_PREFIX_REUSE=0: none, the old behaviour). The marks are
++        // taken at boundaries the run loop already has, so they cost a ~3 MB host copy and a stream sync, not a read.
++        // DS4_PREFIX_STRIDE=<n> cuts the runs shorter than feed_unit, which buys a finer mark for a slower prompt
++        // (the chunk is the expert GEMM's row count - see --prefill-chunk); 0 keeps the runs at feed_unit.
++        //
++        // The default caps a run at 4096 tokens: a run that size is also the fastest measured on a long prompt, and
++        // far more predictable than one feed of the whole prompt. See "run size" in the README - a large feed leaves
++        // the prompt path's own buffers borrowing the experts' VRAM and its read-ahead deeper than the page cache can
++        // hold, which costs ~40% on a long prompt whenever the cache is cold.
++        static const bool prefix_reuse = std::getenv("DS4_PREFIX_REUSE") == nullptr ||
++                                         std::atoi(std::getenv("DS4_PREFIX_REUSE")) != 0;
++        constexpr int kRunDefault = 4096;
++        static const size_t prefix_stride =
++            std::getenv("DS4_PREFIX_STRIDE")
++                ? (size_t) std::max(16, std::atoi(std::getenv("DS4_PREFIX_STRIDE")))
++                : (prefix_reuse ? (size_t) kRunDefault : (size_t) 0);
++        static int mark_slot = 0;   // rotates over the mark slots, across requests
++        auto mark = [&] {
++            if (!prefix_reuse) return;
++            m.checkpoint(2 + mark_slot);
++            mark_slot = (mark_slot + 1) % strata::ds4::kCheckpointMarks;
++        };
+         while (ok && done < total) {
+             if (in.stop.load()) {
+                 stopped = true;
+                 break;
+             }
+-            const size_t n = std::min<size_t>((size_t) m.feed_unit(), total - done);
++            // feed_unit() is the whole prompt when the chunked path runs (the engine chunks it internally, and its
++            // chunks overlap as a pipeline); cutting the run at the chunk's own size keeps the same chunks and lets a
++            // checkpoint sit between them, at the cost of the reads that overlapped across that boundary.
++            size_t unit = (size_t) m.feed_unit();
++            if (prefix_reuse) {
++                const int ch = m.feed_chunk();
++                if (ch > 0) unit = std::min<size_t>(unit, (size_t) ch);
++            }
++            if (prefix_stride > 0) unit = std::min<size_t>(unit, prefix_stride);
++            const size_t n = std::min<size_t>(unit, total - done);
+             // (the prompt's end: the last token in the same run, the checkpoint before it kept on the way)
+             const bool fin = done + n == total;
+             if (fin && last_window) {
+                 ok = (n < 2 || m.feed(r.ids.data() + done, (int) n - 1, 0, err));
+                 if (ok) m.checkpoint(1);
+                 ok = ok && m.feed(r.ids.data() + done + n - 1, 1, 1, err);
+-            } else
+-                ok = fin ? m.feed_mark(r.ids.data() + done, (int) n, 1, 1, err)
+-                         : m.feed(r.ids.data() + done, (int) n, 0, err);
++            } else if (fin)
++                ok = m.feed_mark(r.ids.data() + done, (int) n, 1, 1, err);
++            else {
++                ok = m.feed(r.ids.data() + done, (int) n, 0, err);
++                if (ok) mark();
++            }
+             done += n;
+             if (ok && (done >= next_pp || done == total)) {
+                 const double ms = now_ms() - t0;
+diff --git a/src/ds4/ds4_model.cu b/src/ds4/ds4_model.cu
+index 7dada35..762fe79 100644
+--- a/src/ds4/ds4_model.cu
++++ b/src/ds4/ds4_model.cu
+@@ -1112,7 +1112,7 @@ struct Model::Impl {
+         std::vector<std::vector<uint8_t>> win;
+         std::vector<std::vector<float>> comp;
+     };
+-    Check ck[2];                      // the end of the last prompt, and the position before it
++    Check ck[kCheckpoints];           // the end of the last prompt, the position before it, and prompt-path marks
+     std::vector<uint32_t> prof;       // [nl][n_exp] routed-expert hits
+     // ... as loaded (--no-expert-cache: what the flow's early reads go by, so a prompt is streamed and summed in the
+     // same order whatever this process answered before)
+@@ -5340,6 +5340,7 @@ struct Model::Impl {
+         toks.clear();
+         ctoks.clear();
+         ck[0].pos = ck[1].pos = -1;
++        for (int i = 2; i < kCheckpoints; ++i) ck[i].pos = -1;
+         for (Layer& l0 : L)
+             for (int m = 0; m < l0.nm; ++m) {
+                 Layer& l = member(l0, m);
+@@ -5358,7 +5359,7 @@ struct Model::Impl {
+     // the state at pos into checkpoint `slot` (the window rings and the compressors' partial groups: the rest of the
+     // state is indexed by position, and what lies past a restored position is written again)
+     void checkpoint(int slot) {
+-        Check& c = ck[slot & 1];
++        Check& c = ck[((slot % kCheckpoints) + kCheckpoints) % kCheckpoints];
+         c.pos = pos;
+         c.win.resize(L.size());
+         c.comp.resize(L.size() * 2);
+@@ -5385,7 +5386,7 @@ struct Model::Impl {
+     // the checkpoint at or before position limit (the state's tokens agree with a new prompt up to there), or -1
+     int best_check(int64_t limit) const {
+         int b = -1;
+-        for (int i = 0; i < 2; ++i)
++        for (int i = 0; i < kCheckpoints; ++i)
+             if (ck[i].pos >= 0 && ck[i].pos <= limit && ck[i].pos <= pos && (b < 0 || ck[i].pos > ck[b].pos)) b = i;
+         return b;
+     }
+@@ -9834,7 +9835,7 @@ struct Model::Impl {
+         if (!seed_drafter(pos - nr, nr, 0, err)) return false;
+         if (snap_slot >= 0) {   // checkpoint `snap_slot` from what the layers kept (the drafter's blocks: as they are -
+             // the next feed seeds them again from its own rows, past this position)
+-            Check& ckp = ck[snap_slot & 1];
++            Check& ckp = ck[((snap_slot % kCheckpoints) + kCheckpoints) % kCheckpoints];
+             ckp.pos = run.snap_pos;
+             ckp.win.resize(L.size());
+             ckp.comp.resize(L.size() * 2);
+@@ -10911,6 +10912,7 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
+     return ok;
+ }
+ int Model::feed_unit() const { return p_->chunk > 0 ? std::max(p_->chunk, (int) p_->o.max_context) : kWin; }
++int Model::feed_chunk() const { return p_->chunk; }
+ void Model::set_progress(std::function<void(int64_t)> f) { p_->progress = std::move(f); }
+ void Model::set_cancel(std::function<bool()> f) { p_->cancel = std::move(f); }
+ bool Model::cancelled() const { return p_->halted; }
+diff --git a/src/ds4/ds4_model.hpp b/src/ds4/ds4_model.hpp
+index 0a9b7d2..79741e4 100644
+--- a/src/ds4/ds4_model.hpp
++++ b/src/ds4/ds4_model.hpp
+@@ -18,6 +18,12 @@
+ 
+ namespace strata::ds4 {
+ 
++/// Prompt-path checkpoints the model keeps: slot 0 is the end of the last prompt, slot 1 the position before its last
++/// token (a next turn that re-renders it shares one of them), and slots 2.. are the marks taken along a prompt's runs,
++/// so a prompt that diverges in the middle can go back to the mark before the divergence instead of starting over.
++constexpr int kCheckpoints = 16;
++constexpr int kCheckpointMarks = kCheckpoints - 2;
++
+ struct Options {
+     std::string pack;                 // <model>/maya-ds4
+     int64_t max_context = 32768;
+@@ -124,6 +130,9 @@ public:
+     /// Tokens a feed call takes at a time to use the chunked prompt path (all of a prompt: its chunks run as a
+     /// pipeline; 16 without it).
+     int feed_unit() const;
++    /// The prompt path's chunk size (0: the windowed path, 16-token windows): the granularity its chunks break at, and
++    /// so the finest place a caller can put a checkpoint between runs without asking for smaller chunks.
++    int feed_chunk() const;
+     /// Called from feed() while a run of chunks goes through the layers, with the tokens done so far.
+     void set_progress(std::function<void(int64_t)> f);
+     /// Asked while a run of chunks goes through the layers: true (a Stop) ends it early - one GPU after the layer it is
+@@ -140,8 +149,10 @@ public:
+     const std::vector<int32_t>& tokens() const;   // what the state has consumed, in order
+ 
+     void reset();
+-    /// Keep the state at the current position in checkpoint slot 0 or 1 (the end of a prompt, the position before it);
+-    /// restore(limit) goes back to the latest one at or before limit (-1: none).
++    /// Keep the state at the current position in a checkpoint slot (0: the end of a prompt, 1: the position before its
++    /// last token, 2..kCheckpoints-1: the marks a prompt's runs leave along the way); restore(limit) goes back to the
++    /// latest one at or before limit (-1: none), so a prompt that diverges in its middle reads only from the mark
++    /// before the divergence.
+     void checkpoint(int slot = 0);
+     bool restore(int64_t limit);
+     int64_t restorable(int64_t limit) const;

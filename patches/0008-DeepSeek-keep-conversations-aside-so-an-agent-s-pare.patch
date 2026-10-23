@@ -1,0 +1,1349 @@
+From 9d5e18537c7480f0e2fee9c63ff0e957ba3d44a7 Mon Sep 17 00:00:00 2001
+From: mrsirg97-rgb <mrsirg97@gmail.com>
+Date: Wed, 21 Oct 2026 18:34:15 -0400
+Subject: [PATCH 8/9] DeepSeek: keep conversations aside, so an agent's parent
+ and workers don't re-read each other's prompts
+
+MAYA_DS4_SLOT_KEEP=1 sets a conversation aside when another one takes the model - its whole state, the
+compressed KV and index keys included - and a request that continues it reads only its new tokens; the
+conversations outlive the engine in MAYA_DS4_SLOT_DIR, capped by MAYA_DS4_SLOT_CAP (RAM) and MAYA_DS4_SLOT_GB
+(the folder). Off by default. A fresh engine holds 0 tokens, which no prompt continues, so a restart's first
+request takes the folder's slot instead of reading from token 0.
+
+tools/ds4/slot_keep_test.py: A, B, A's next turn in one run (reused = A's full prefix), the same from the
+folder after a restart, greedy tokens against a no-keep reference (real text, the turn built from the
+reference's answer so the prompts are identical), and a third conversation forcing the LRU out of the folder.
+
+(cherry picked from commit 993b566a024b15394c411c3db9a4c91589fbb92c)
+(cherry picked from commit 08ad5852c65fc8c374d7d1405948b3fd7147404d)
+---
+ README.md                   |  17 ++
+ docs/SETTINGS.md            |  26 +++
+ src/ds4/ds4_main.cpp        | 392 ++++++++++++++++++++++++++++++++-
+ src/ds4/ds4_model.cu        | 293 +++++++++++++++++++++++++
+ src/ds4/ds4_model.hpp       |  16 +-
+ tools/ds4/slot_keep_test.py | 417 ++++++++++++++++++++++++++++++++++++
+ 6 files changed, 1151 insertions(+), 10 deletions(-)
+ create mode 100644 tools/ds4/slot_keep_test.py
+
+diff --git a/README.md b/README.md
+index 0cd694e..52b0441 100644
+--- a/README.md
++++ b/README.md
+@@ -209,6 +209,23 @@ builds everything once (20-40 minutes plus the download) and **starts the model*
+   [speed calibration](docs/SETTINGS.md#the-speed-calibration) measures it on your PC and keeps it only where it is
+   faster. The drafter's license is non-commercial (CC BY-NC-ND 4.0).
+ 
++### DeepSeek: conversations kept
++
++The DeepSeek-V4.1-Flash-1017 engine holds one conversation: a prompt that continues it reuses its state, anything else
++starts over. With this on, a conversation another request takes the model from - a chat, or an agent's parent and
++workers - is set aside, and a request that continues it reads only its new tokens: in RAM, or across a restart from
++the folder. Off by default; the config sets them under the same `MAYA_DS4_*` names
++([how](docs/SETTINGS.md#deepseek-conversations-kept-an-agents-parent-and-workers-on-one-model)):
++
++| Setting | Default | |
++| --- | --- | --- |
++| `STRATA_DS4_SLOT_KEEP` | off | `1`: conversations are set aside when another one takes the model, and kept across runs in the folder; `0`: every switch reads its prompt from token 0, as before |
++| `STRATA_DS4_SLOT_CAP` | 4 | conversations kept in RAM (tens to hundreds of MB each); past it the least recently used is written to the folder and read back from there; `0` = none |
++| `STRATA_DS4_SLOT_GB` | 16 | the folder's total size (GB, its `.bin` files): past it the folder's least recently used conversation is removed - never the one just written, so a conversation bigger than the cap stays |
++| `STRATA_DS4_SLOT_DIR` | `<pack>/slots` | the folder: a conversation is a `.bin` (its state) and a `.meta` (this model's identity, its tokens and its size) |
++| `STRATA_DS4_SLOT_MIN` | 1024 | the shortest conversation set aside (tokens): a shorter one is read again in about the time its slot would take |
++| `STRATA_DS4_SLOT_DAYS` | 7 | a slot not used for this many days is removed at start; so is any file not this model's, another engine's, or incomplete |
++
+ ## Something went wrong?
+ 
+ Run **`./maya.sh --report`** (Windows: `START-MAYA.bat --report`) right after a slow answer or an error, and attach the
+diff --git a/docs/SETTINGS.md b/docs/SETTINGS.md
+index 6abb028..7d4ce82 100644
+--- a/docs/SETTINGS.md
++++ b/docs/SETTINGS.md
+@@ -445,3 +445,29 @@ pack has no counts yet, so the setup copies `data/expert-profile-ds4.bin` into i
+ chat, code, multilingual text, reasoning and tool calls (`tools/ds4/profile.py`). Its counts weigh as much as about
+ 2,000 tokens of answers, so what your PC routes soon outweighs them. A pack that already has a profile keeps its own;
+ an `--expert-profile` in the config's `args` (a file, or `none`) is used instead.
++
++## DeepSeek: conversations kept (an agent's parent and workers on one model)
++
++The engine holds one conversation: a prompt that continues it reuses its state, anything else starts over. An agent
++whose parent and workers interleave - and whose prompts alternate between ~70k and ~185k tokens - then reads the
++whole prompt again on every switch (257 of 632 requests in one log read from token 0; the 142 of them longer than 30k
++tokens read at ~930 tok/s: a 70k-token prompt takes ~75 s, a 185k one ~200 s). With this on, the conversation in the
++model is set aside when another one takes its place - its whole state: the position, every layer's 128-token window
++ring, the compressors' partial groups and the four KV sources' compressed KV and index keys up to it - and a request
++that continues a kept conversation takes it back, reading only its new tokens (a 12k-token conversation back in ~0.1 s
++instead of ~12 s). Text only: a conversation that holds pictures is not set aside, and a prompt with pictures takes
++none back. Off by default, so the engine is unchanged unless asked.
++
++| Setting | Default | |
++| --- | --- | --- |
++| `MAYA_DS4_SLOT_KEEP` | off | `1`: keep the conversation when another one takes the model, and across runs in the folder; `0`: every prompt that does not continue the conversation in the model reads it from token 0, as before |
++| `MAYA_DS4_SLOT_CAP` | 4 | the conversations kept in RAM (one is tens to hundreds of MB, the context's compressed KV being the most); past it the least recently used is written to the folder - RAM first, the folder past the cap - and read back from there (reading a 185k-token state off an NVMe: ~0.5 s, against ~200 s of re-reading); `0` = no conversations kept |
++| `MAYA_DS4_SLOT_GB` | 16 | the folder's conversations' total size (GB, over their `.bin` files): at start, and after every conversation written to it, the least recently used in the folder is removed while they are over it - never the one just written, so a conversation bigger than the cap stays |
++| `MAYA_DS4_SLOT_DIR` | `<pack>/slots` | the folder: a conversation is a `.bin` (its state) and a `.meta` (this model's identity, its tokens and its size), both written under a temporary name first |
++| `MAYA_DS4_SLOT_MIN` | 1024 | the shortest conversation set aside (tokens): a shorter one is read again in about the time its slot would take |
++| `MAYA_DS4_SLOT_DAYS` | 7 | a slot not used for this many days is removed at start; so is any file not this model's, another engine's, or incomplete. The engine's end (QUIT or the end of its input) writes the conversations in RAM to the folder, so a restart reads on from them (the server gives it `MAYA_ENGINE_QUIT_S`, 50 s, to do so) |
++
++The engine's log says what happened (`ds4 slots: saved/took back/wrote ...`; the server shows those lines as
++`[maya] sessions: ...`). A slot's identity is the engine's version, the model's geometry and files and whether the
++DSpark blocks are loaded, so a slot from another model, another pack or an engine that changed the state's layout is
++refused rather than read.
+diff --git a/src/ds4/ds4_main.cpp b/src/ds4/ds4_main.cpp
+index 9f0bb57..54cbebe 100644
+--- a/src/ds4/ds4_main.cpp
++++ b/src/ds4/ds4_main.cpp
+@@ -11,7 +11,10 @@
+ // continues the state (the conversation so far) reuses it; one that only shares the last prompt's start goes back to
+ // that prompt's end, or to the last checkpoint mark before where the two part (DS4_PREFIX_REUSE=0: only the ends,
+ // the older behaviour); anything else starts over.  `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures
+-// (the file: see read_pics); the state is shared only where the same picture sits at the same place.
++// (the file: see read_pics); the state is shared only where the same picture sits at the same place.  With
++// MAYA_DS4_SLOT_KEEP=1 the conversations are kept when another one takes the model (a slot each: the state, the
++// compressed KV included), and across runs in MAYA_DS4_SLOT_DIR - so a request that does not continue the state but
++// does continue a kept conversation reads only its new tokens.
+ #include "ds4_model.hpp"
+ #include "strata/platform/env_alias.hpp"
+ 
+@@ -23,12 +26,15 @@
+ #include <climits>
+ #include <cmath>
+ #include <condition_variable>
++#include <csignal>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <deque>
++#include <filesystem>
+ #include <fstream>
+ #include <iostream>
++#include <memory>
+ #include <mutex>
+ #include <string>
+ #include <thread>
+@@ -332,7 +338,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
+     return !r.ids.empty() && (!geni || !r.file.empty());
+ }
+ 
+-int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min) {
++int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack) {
+     std::vector<int> eos = parse_ids(eos_list);
+     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
+     std::printf("READY %lld stop\n", (long long) m.max_context());
+@@ -354,6 +360,334 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
+     };
+     SpanCache spans;
+     const int img_tok = m.image_token();
++    // CONVERSATION SLOTS: a request that does not continue the conversation in the model first sets that one aside
++    // (Model::slot_save: its window rings, the compressors' partial groups and every source's compressed KV and index
++    // keys), then takes back the kept conversation this prompt does continue (slot_load) - chats, and an agent's side
++    // requests, that interleave no longer re-read each other's prompts (70k and 185k tokens alternating: 75-200 s a
++    // switch at ~930 tok/s).  MAYA_DS4_SLOT_KEEP=1 turns them on and keeps them across runs, in MAYA_DS4_SLOT_DIR
++    // (default <pack>/slots): a slot is a .bin (the state) and a .meta (this model's identity, the conversation's
++    // tokens and its size), both written under a temporary name first; a slot whose .meta is missing, foreign or does
++    // not match its file, or unused for MAYA_DS4_SLOT_DAYS (7) days, is removed at start.  MAYA_DS4_SLOT_CAP (4) is
++    // the conversations kept in RAM; past it the least recently used is written to the folder and read back from there
++    // (RAM first, the folder past the cap), and the engine's end writes the ones in RAM to the folder, so the next run
++    // reads on from them.  MAYA_DS4_SLOT_GB (16) caps the folder's .bin files: at start, and after every write, the
++    // folder's least recently used conversation is removed while they are over it (never the one just written, so a
++    // conversation bigger than the cap stays).  MAYA_DS4_SLOT_MIN (1024) is the shortest conversation set aside (a
++    // shorter one is read again in about the time its slot would take).  Text only: a conversation that holds pictures
++    // is not set aside, and a prompt with pictures takes none back.
++    const auto env_num = [](const char* k, double d) { const char* v = std::getenv(k); return v ? std::atof(v) : d; };
++    const bool slot_keep =
++        std::getenv("STRATA_DS4_SLOT_KEEP") != nullptr && std::atoi(std::getenv("STRATA_DS4_SLOT_KEEP")) != 0;
++    int slot_max = slot_keep ? std::max(0, (int) env_num("STRATA_DS4_SLOT_CAP", 4)) : 0;
++    const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_DS4_SLOT_MIN", 1024));
++    const double slot_days = env_num("STRATA_DS4_SLOT_DAYS", 7);
++    const uint64_t slot_budget = (uint64_t) (env_num("STRATA_DS4_SLOT_GB", 16) * 1073741824.0);
++    namespace fs = std::filesystem;
++    std::filesystem::path slot_dir;
++    struct Slot {
++        std::vector<int32_t> tokens;
++        std::string path;                            // empty: the state is in data (RAM)
++        uint64_t bytes = 0, used = 0;
++        std::shared_ptr<std::vector<uint8_t>> data;   // the RAM slot's bytes (null: a file slot)
++    };
++    std::vector<Slot> slots;
++    uint64_t slot_clock = 0, slot_seq = 0;
++    const std::string slot_identity = m.slot_identity();
++    constexpr uint64_t kMetaMagic = 0x314154454d345344ull;   // "DS4META1" (little endian)
++    const auto note = [&](const std::string& msg) {
++        std::fprintf(stderr, "ds4 slots: %s\n", msg.c_str());
++        std::printf("NOTE sessions: %s\n", msg.c_str());
++        std::fflush(stdout);
++    };
++    const auto gb = [](uint64_t b) {
++        char s[32];
++        std::snprintf(s, sizeof s, "%.2f GB", (double) b / 1e9);
++        return std::string(s);
++    };
++    const auto meta_of = [](const std::string& bin) { return bin.substr(0, bin.size() - 4) + ".meta"; };
++    const auto meta_write = [&](const std::string& path, const std::vector<int32_t>& toks, uint64_t bytes) -> bool {
++        const std::string tmp = path + ".tmp";
++        {
++            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
++            const uint64_t il = slot_identity.size(), nt = toks.size();
++            f.write((const char*) &kMetaMagic, 8);
++            f.write((const char*) &il, 8);
++            f.write(slot_identity.data(), (std::streamsize) il);
++            f.write((const char*) &bytes, 8);
++            f.write((const char*) &nt, 8);
++            f.write((const char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t)));
++            f.write((const char*) &kMetaMagic, 8);
++            f.flush();
++            if (!f) return false;
++        }
++        std::error_code ec;
++        fs::rename(tmp, path, ec);
++        return !ec;
++    };
++    // a .meta of this model -> its tokens and the slot's size (false: foreign, damaged or not this model's)
++    const auto meta_read = [&](const std::string& path, std::vector<int32_t>& toks, uint64_t& bytes) -> bool {
++        std::ifstream f(path, std::ios::binary);
++        uint64_t m0 = 0, il = 0, nt = 0, m1 = 0;
++        if (!f.read((char*) &m0, 8) || m0 != kMetaMagic || !f.read((char*) &il, 8) || il != slot_identity.size())
++            return false;
++        std::string id(il, '\0');
++        if (!f.read(id.data(), (std::streamsize) il) || id != slot_identity) return false;
++        if (!f.read((char*) &bytes, 8) || !f.read((char*) &nt, 8) || nt == 0 || nt > (uint64_t) m.max_context())
++            return false;
++        toks.resize(nt);
++        return (bool) f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) && f.read((char*) &m1, 8) &&
++               m1 == kMetaMagic;
++    };
++    const auto slot_age_days = [](const std::string& p) {
++        std::error_code ec;
++        const auto t = fs::last_write_time(p, ec);
++        if (ec) return 1e9;
++        return std::chrono::duration<double>(fs::file_time_type::clock::now() - t).count() / 86400.0;
++    };
++    const auto slot_drop = [&](size_t i) {
++        if (slots[i].data)   // a RAM slot: its buffer simply dies
++            slots[i].data.reset();
++        else {
++            std::error_code ec;
++            std::filesystem::remove(slots[i].path, ec);
++            std::filesystem::remove(meta_of(slots[i].path), ec);
++        }
++        slots.erase(slots.begin() + (long) i);
++    };
++    const auto slot_count = [&](int& ram, int& disk) {
++        ram = disk = 0;
++        for (const Slot& s : slots) (s.data ? ram : disk) += 1;
++    };
++    // the folder's conversations (their .bin; a .meta beside each is a few KB: identity and tokens)
++    const auto slot_folder_bytes = [&]() {
++        uint64_t total = 0;
++        std::error_code ec;
++        for (const auto& de : std::filesystem::directory_iterator(slot_dir, ec)) {
++            const std::string fn = de.path().filename().string();
++            if (fn.rfind("slot-", 0) == 0 && fn.size() > 9 && fn.compare(fn.size() - 4, 4, ".bin") == 0) {
++                const uint64_t bytes = (uint64_t) std::filesystem::file_size(de.path(), ec);
++                if (!ec) total += bytes;
++            }
++        }
++        return total;
++    };
++    // the folder over MAYA_DS4_SLOT_GB: its least recently used conversation goes first, and never `keep` (the one just
++    // written), so a conversation bigger than the cap stays
++    const auto slot_trim = [&](const std::string& keep) {
++        const uint64_t before = slot_folder_bytes();
++        size_t dropped = 0;
++        while (slot_folder_bytes() > slot_budget) {
++            size_t lru = SIZE_MAX;
++            for (size_t i = 0; i < slots.size(); ++i)
++                if (!slots[i].data && slots[i].path != keep && (lru == SIZE_MAX || slots[i].used < slots[lru].used))
++                    lru = i;
++            if (lru == SIZE_MAX) break;
++            slot_drop(lru);
++            ++dropped;
++        }
++        if (dropped > 0) {
++            char msg[256];
++            std::snprintf(msg, sizeof msg, "the folder held %s (over MAYA_DS4_SLOT_GB, %s): %zu least recently used "
++                          "conversation(s) removed, %s left", gb(before).c_str(), gb(slot_budget).c_str(), dropped,
++                          gb(slot_folder_bytes()).c_str());
++            note(msg);
++        }
++    };
++    // a RAM slot into the folder (its bytes, then its .meta); false: not written (its bytes go, then)
++    const auto slot_write_file = [&](Slot& s) -> bool {
++        std::error_code ec;
++        const auto space = std::filesystem::space(slot_dir, ec);
++        if (!ec && space.available < ((uint64_t) 8 << 30)) {   // (8 GB free, the GLM engine's guard)
++            std::fprintf(stderr, "ds4 slots: under 8 GB free in %s - the conversation is not written\n",
++                         slot_dir.string().c_str());
++            return false;
++        }
++        const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
++                               std::chrono::system_clock::now().time_since_epoch()).count();
++        const std::string path =
++            (slot_dir / ("slot-" + std::to_string(stamp) + "-" + std::to_string(++slot_seq) + ".bin")).string();
++        {
++            std::ofstream f(path + ".tmp", std::ios::binary | std::ios::trunc);
++            f.write((const char*) s.data->data(), (std::streamsize) s.data->size());
++            f.flush();
++            if (!f) {
++                std::filesystem::remove(path + ".tmp", ec);
++                std::fprintf(stderr, "ds4 slots: writing %s.tmp failed (disk full?)\n", path.c_str());
++                return false;
++            }
++        }
++        fs::rename(path + ".tmp", path, ec);
++        if (ec || !meta_write(meta_of(path), s.tokens, s.data->size())) {
++            std::filesystem::remove(path + ".tmp", ec);
++            std::filesystem::remove(path, ec);
++            std::fprintf(stderr, "ds4 slots: writing %s failed\n", path.c_str());
++            return false;
++        }
++        s.path = path;
++        s.bytes = s.data->size();
++        s.data.reset();
++        slot_trim(path);   // (the folder over its cap: the least recently used conversation goes, not this one)
++        return true;
++    };
++    // the conversation in the model into a slot (the state is lost otherwise: another one takes the model)
++    const auto slot_put = [&](const char* why) {
++        if (slot_max <= 0) return;
++        const std::vector<int32_t>& t = m.tokens();
++        if (t.size() < slot_min) return;   // (a fresh engine's 0-token state is no conversation: nothing to set aside)
++        const auto t0 = std::chrono::steady_clock::now();
++        auto buf = std::make_shared<std::vector<uint8_t>>();
++        std::string e;
++        const uint64_t bytes = m.slot_save(*buf, e);   // (a state unchanged since it was taken refuses here: nothing
++        if (bytes == 0) {                             // changes, its slot stays)
++            if (e != "it is already set aside")
++                std::fprintf(stderr, "ds4 slots: setting the conversation aside failed (%s) - it is read from token 0 "
++                                     "when it comes back\n", e.c_str());
++            return;
++        }
++        for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded
++            if (slots[i].tokens.size() <= t.size() && std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), t.begin()))
++                slot_drop(i);
++        slots.push_back({t, "", bytes, ++slot_clock, nullptr});
++        slots.back().data = buf;
++        while (true) {   // past the cap: the least recently used conversation in RAM to the folder, or gone
++            int ram = 0, disk = 0;
++            slot_count(ram, disk);
++            if (ram <= slot_max) break;
++            size_t lru = SIZE_MAX;
++            for (size_t i = 0; i < slots.size(); ++i)
++                if (slots[i].data && (lru == SIZE_MAX || slots[i].used < slots[lru].used)) lru = i;
++            if (lru == SIZE_MAX) break;
++            if (!slot_write_file(slots[lru])) slot_drop(lru);
++        }
++        int ram = 0, disk = 0;
++        slot_count(ram, disk);
++        char msg[256];
++        std::snprintf(msg, sizeof msg, "saved a %zu-token conversation%s (%s in RAM in %.1f s); %d in RAM, %d in %s",
++                      t.size(), why, gb(bytes).c_str(),
++                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), ram, disk,
++                      slot_dir.string().c_str());
++        note(msg);
++    };
++    // the longest kept conversation this prompt continues - past `floor` tokens, the one the model itself can go back
++    // to - back in the model: the tokens it covers (0: none)
++    const auto slot_take = [&](const std::vector<int>& prompt, size_t floor) -> size_t {
++        if (slot_max <= 0) return 0;
++        size_t best = SIZE_MAX, len = 0;
++        for (size_t i = 0; i < slots.size(); ++i) {
++            const auto& t = slots[i].tokens;
++            if (t.size() > len && t.size() > floor && t.size() < prompt.size() &&
++                std::equal(t.begin(), t.end(), prompt.begin())) {
++                best = i;
++                len = t.size();
++            }
++        }
++        if (best == SIZE_MAX) return 0;
++        const auto t0 = std::chrono::steady_clock::now();
++        const bool ram = slots[best].data != nullptr;
++        std::string e;
++        bool back = false;
++        if (ram) back = m.slot_load(slots[best].data->data(), slots[best].data->size(), (int64_t) len, e);
++        else {
++            std::ifstream f(slots[best].path, std::ios::binary);
++            std::vector<uint8_t> file;
++            if (f) {
++                f.seekg(0, std::ios::end);
++                const std::streamoff n = f.tellg();
++                f.seekg(0, std::ios::beg);
++                if (n > 0) {
++                    file.resize((size_t) n);
++                    if (f.read((char*) file.data(), n)) back = m.slot_load(file.data(), file.size(), (int64_t) len, e);
++                    else e = "reading " + slots[best].path + " failed";
++                } else e = slots[best].path + " is empty";
++            } else e = "cannot read " + slots[best].path;
++        }
++        if (!back) {
++            note("taking a conversation back failed (" + (e.empty() ? std::string("it did not load") : e) +
++                 ") - reading its prompt again");
++            slot_drop(best);
++            return 0;
++        }
++        slots[best].used = ++slot_clock;
++        if (!ram) {   // its age counts from its last use (a file slot's only)
++            std::error_code ec;
++            fs::last_write_time(meta_of(slots[best].path), fs::file_time_type::clock::now(), ec);
++        }
++        char msg[192];
++        std::snprintf(msg, sizeof msg, "took back a %zu-token conversation from %s (%.1f s); %zu new tokens to read",
++                      len, ram ? "RAM" : "the folder",
++                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
++                      prompt.size() - len);
++        note(msg);
++        return len;
++    };
++    if (slot_max > 0) {
++        slot_dir = std::getenv("STRATA_DS4_SLOT_DIR") ? std::filesystem::path(std::getenv("STRATA_DS4_SLOT_DIR"))
++                                                      : std::filesystem::path(pack) / "slots";
++        std::error_code ec;
++        std::filesystem::create_directories(slot_dir, ec);
++        if (!std::filesystem::is_directory(slot_dir, ec)) {
++            std::fprintf(stderr, "ds4 slots: %s is not writable - conversations are not set aside\n",
++                         slot_dir.string().c_str());
++            slot_max = 0;
++        } else {
++            struct Found {
++                std::string bin;
++                std::vector<int32_t> toks;
++                uint64_t bytes;
++                fs::file_time_type t;
++            };
++            std::vector<Found> found;
++            size_t refused = 0;
++            for (const auto& de : std::filesystem::directory_iterator(slot_dir, ec)) {   // a previous run's slots
++                const std::string fn = de.path().filename().string(), p = de.path().string();
++                if (fn.rfind("slot-", 0) != 0) continue;
++                const bool is_bin = fn.size() > 9 && fn.compare(fn.size() - 4, 4, ".bin") == 0;
++                const bool is_meta = fn.size() > 10 && fn.compare(fn.size() - 5, 5, ".meta") == 0;
++                if (!is_bin && !is_meta) {   // a .tmp an interrupted write left
++                    std::filesystem::remove(de.path(), ec);
++                    continue;
++                }
++                if (!is_meta) continue;      // a .bin is judged by its .meta
++                const std::string bin = p.substr(0, p.size() - 5) + ".bin";
++                Found fd{bin, {}, 0, fs::last_write_time(de.path(), ec)};
++                const uint64_t have = fs::exists(bin, ec) ? (uint64_t) fs::file_size(bin, ec) : 0;
++                if (meta_read(p, fd.toks, fd.bytes) && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days)
++                    found.push_back(std::move(fd));
++                else {
++                    ++refused;
++                    std::filesystem::remove(p, ec);
++                    std::filesystem::remove(bin, ec);
++                }
++            }
++            for (const auto& de : std::filesystem::directory_iterator(slot_dir, ec)) {   // a .bin without its .meta
++                const std::string p = de.path().string(), fn = de.path().filename().string();
++                if (fn.rfind("slot-", 0) == 0 && fn.size() > 9 && fn.compare(fn.size() - 4, 4, ".bin") == 0 &&
++                    !fs::exists(meta_of(p), ec))
++                    std::filesystem::remove(de.path(), ec);
++            }
++            std::sort(found.begin(), found.end(), [](const Found& a, const Found& b) { return a.t < b.t; });
++            uint64_t total = 0;
++            for (auto& fd : found) {
++                total += fd.bytes;
++                slots.push_back({std::move(fd.toks), fd.bin, fd.bytes, ++slot_clock, nullptr});
++            }
++            std::string msg = "folder " + slot_dir.string() + ": " + std::to_string(slots.size()) +
++                              " conversation(s) kept from earlier runs (" + gb(total) + ")";
++            if (refused) msg += ", " + std::to_string(refused) + " not this model's or incomplete - removed";
++            note(msg);
++            slot_trim("");   // (the folder over MAYA_DS4_SLOT_GB: the least recently used conversation goes first)
++        }
++    }
++    if (slot_max > 0) {
++#if !defined(_WIN32)
++        // (the server ends the engine with QUIT and waits for it; a SIGTERM to the whole process group - systemd
++        // stopping a service, a supervisor killing the server's group - must not end it mid-write, and a server that
++        // is already gone must not end it with SIGPIPE when it writes its last lines)
++        std::signal(SIGTERM, SIG_IGN);
++        std::signal(SIGINT, SIG_IGN);
++        std::signal(SIGPIPE, SIG_IGN);
++#endif
++    }
+     while (in.next(line)) {
+         if (line == "QUIT") break;
+         const bool geni = line.rfind("GENI ", 0) == 0;
+@@ -402,12 +736,27 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
+         for (const Pic& q : held)
+             if ((size_t) q.start < c && !same(pics, q)) c = (size_t) q.start;
+         size_t from = 0;
+-        if (c == n_state && n_state < r.ids.size()) from = n_state;
+-        else if (m.restorable((int64_t) std::min(c, r.ids.size() - 1)) >= 0 &&
+-                 m.restore((int64_t) std::min(c, r.ids.size() - 1)))
+-            from = (size_t) m.pos();
+-        else m.reset();
+-        if (from == 0) held.clear();
++        bool took = false;
++        // the conversation continues, reused in place - a conversation has to be in the model first: a fresh engine
++        // (the start of a run, so every restart) holds 0 tokens, and every prompt "continues" that to token 0; taken
++        // as a continuation, the take below would never run for the folder's conversations, the case they are for
++        if (n_state > 0 && c == n_state && n_state < r.ids.size()) from = n_state;
++        else {
++            // CONVERSATION SLOTS: this prompt does not continue the conversation in the model - that one is set aside
++            // first (another one takes the model, and its state is lost otherwise), then the kept conversation this
++            // prompt does continue is taken back - if it goes further back than the checkpoints the state itself holds
++            if (held.empty()) slot_put("");
++            const int64_t limit = (int64_t) std::min(c, r.ids.size() - 1);
++            const int64_t rs = m.restorable(limit);
++            const size_t back = pics.empty() ? slot_take(r.ids, rs > 0 ? (size_t) rs : 0) : 0;
++            if (back > 0) {
++                from = back;
++                took = true;
++            } else if (rs >= 0 && m.restore(limit))
++                from = (size_t) m.pos();
++            else m.reset();
++        }
++        if (took || from == 0) held.clear();   // (a slot is text only: the state that comes back holds no pictures)
+         if ((int64_t) r.ids.size() + std::max(0LL, r.max_new) > m.max_context()) {
+             std::printf("ERR the prompt (%zu tokens) and max_new %lld are more than the context %lld\n", r.ids.size(),
+                         r.max_new, (long long) m.max_context());
+@@ -676,6 +1025,31 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
+                                     per_position(s_dec, s).c_str());
+         m.save_profile();
+     }
++    // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in
++    // RAM is written to the folder, so the next run reads on from them
++    if (slot_max > 0) {
++        if (held.empty()) slot_put(" as the engine ended");
++        size_t written = 0;
++        while (true) {   // (a write can take the folder's least recently used conversation away: the list is asked again)
++            size_t i = SIZE_MAX;
++            for (size_t k = 0; k < slots.size(); ++k)
++                if (slots[k].data) {
++                    i = k;
++                    break;
++                }
++            if (i == SIZE_MAX) break;
++            if (slot_write_file(slots[i])) ++written;
++            else slot_drop(i);   // (its state could not be written: there is nothing more to do at the engine's end)
++        }
++        if (written > 0) {
++            int ram = 0, disk = 0;
++            slot_count(ram, disk);
++            char msg[256];
++            std::snprintf(msg, sizeof msg, "wrote %zu conversation(s) to %s; %d there in all", written,
++                          slot_dir.string().c_str(), disk);
++            note(msg);
++        }
++    }
+     m.save_profile();
+     return 0;
+ }
+@@ -786,7 +1160,7 @@ int main(int argc, char** argv) {
+         return 1;
+     }
+     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
+-    if (serve_mode) return serve(m, eos, spec, o.dspark_conf);
++if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack);
+     if (!ppl.empty()) {   // --ppl FILE: a line a sequence of ids (BOS + text), each in one forward, tokens 2.. scored
+         std::ifstream in(ppl);
+         std::string line;
+diff --git a/src/ds4/ds4_model.cu b/src/ds4/ds4_model.cu
+index 505ac14..d206f61 100644
+--- a/src/ds4/ds4_model.cu
++++ b/src/ds4/ds4_model.cu
+@@ -46,6 +46,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <filesystem>
+ #include <fstream>
+ #include <functional>
+ #include <future>
+@@ -1114,6 +1115,7 @@ struct Model::Impl {
+         std::vector<std::vector<float>> comp;
+     };
+     Check ck[kCheckpoints];           // the end of the last prompt, the position before it, and prompt-path marks
++    bool slot_held = false;           // slot_save took this state and nothing has changed it since
+     std::vector<uint32_t> prof;       // [nl][n_exp] routed-expert hits
+     // ... as loaded (--no-expert-cache: what the flow's early reads go by, so a prompt is streamed and summed in the
+     // same order whatever this process answered before)
+@@ -5424,6 +5426,7 @@ struct Model::Impl {
+         pos = 0;
+         toks.clear();
+         ctoks.clear();
++        slot_held = false;
+         ck[0].pos = ck[1].pos = -1;
+         for (int i = 2; i < kCheckpoints; ++i) ck[i].pos = -1;
+         for (Layer& l0 : L)
+@@ -5503,11 +5506,294 @@ struct Model::Impl {
+         pos = c.pos;
+         toks.resize((size_t) pos);
+         ctoks.resize((size_t) pos);
++        slot_held = false;
+         for (Check& o2 : ck)   // a later checkpoint saw tokens the state no longer has
+             if (o2.pos > pos) o2.pos = -1;
+         return true;
+     }
+ 
++    // ---- the kept conversations (a slot): the state out of the model and back, through a file or a host buffer.
++    // A prompt that continues the state is reused in place (checkpoint / restore, the compressed KV left where it is);
++    // a conversation that leaves the model for another one is a slot - the whole state: the position, its tokens,
++    // every window ring (the DSpark blocks' included), the compressors' partial groups and each KV source's compressed
++    // KV and index keys up to it (rows 0 .. pos / ratio, the groups its position completed; one the prompt has not
++    // completed yet lives in the compressor's partial group).  A tensor parallel group's members hold the same state,
++    // so one member's ring is saved and written back into all of them.  Text only: a conversation that holds pictures
++    // is not a slot (the Engram history's rows are the tokens' again, no -1 among them).
++    static constexpr uint64_t kSlotMagic = 0x31544f4c53345344ull;   // "DS4SLOT1" (little endian)
++
++    int64_t src_rows(const Src& s) const { return pos / std::max(1, s.ratio); }
++
++    // the slot's bytes: the header, the tokens, every layer's ring and partial group, every source's rows, the end
++    size_t slot_bytes() const {
++        size_t n = 8 + 8 + slot_identity().size() + 8 + (size_t) pos * 4;
++        for (const Layer& l : L) n += 8 + (size_t) g.win * win_rb() + 8 + (l.c_kv ? 2 * (size_t) l.ratio * g.hd * 4 : 0);
++        for (const Src& s : srcs) n += 8 + (size_t) src_rows(s) * (ckv_rb() + ik_rb());
++        return n + 8;
++    }
++
++    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err) {
++        if (slot_held) {
++            err = "it is already set aside";
++            return 0;
++        }
++        if (pos <= 0) {
++            err = "there is no conversation";
++            return 0;
++        }
++        if ((int64_t) toks.size() != pos) {
++            err = "the state's tokens do not match its position";
++            return 0;
++        }
++        if (!imgs.empty()) {
++            err = "it holds pictures";
++            return 0;
++        }
++        const std::string id = slot_identity();
++        out.assign(slot_bytes(), 0);
++        uint8_t* p = out.data();
++        size_t off = 0;
++        const auto put = [&](const void* s, size_t b) {
++            std::memcpy(p + off, s, b);
++            off += b;
++        };
++        const uint64_t il = id.size(), n = (uint64_t) pos;
++        put(&kSlotMagic, 8);
++        put(&il, 8);
++        put(id.data(), (size_t) il);
++        put(&n, 8);
++        put(toks.data(), (size_t) n * 4);
++        for (Dev& d : devs) {   // (the devices' work ends before their state is read)
++            cudaSetDevice(d.id);
++            cudaStreamSynchronize(d.st);
++        }
++        for (size_t i = 0; i < L.size(); ++i) {
++            const Layer& l = L[i];
++            const Dev& d = devs[(size_t) l.dev];
++            cudaSetDevice(d.id);
++            const uint64_t wb = (uint64_t) g.win * win_rb();
++            put(&wb, 8);
++            if (cudaMemcpy(p + off, l.win, (size_t) wb, cudaMemcpyDeviceToHost) != cudaSuccess) {
++                err = l.name + "window ring: " + cudaGetErrorString(cudaGetLastError());
++                return 0;
++            }
++            off += (size_t) wb;
++            const uint64_t cn = l.c_kv ? (uint64_t) l.ratio * (uint64_t) g.hd : 0;
++            put(&cn, 8);
++            if (cn > 0) {
++                const size_t cb = (size_t) cn * 4;
++                if (cudaMemcpy(p + off, l.c_kv, cb, cudaMemcpyDeviceToHost) != cudaSuccess ||
++                    cudaMemcpy(p + off + cb, l.c_score, cb, cudaMemcpyDeviceToHost) != cudaSuccess) {
++                    err = l.name + "compressor's group: " + cudaGetErrorString(cudaGetLastError());
++                    return 0;
++                }
++                off += 2 * cb;
++            }
++        }
++        for (const Src& s : srcs) {
++            const uint64_t rows = (uint64_t) src_rows(s);
++            put(&rows, 8);
++            if (rows == 0) continue;
++            const int di = L[(size_t) s.layer].dev;
++            const uint8_t* ckv = s.ckv[(size_t) di];
++            const uint8_t* ik = s.ik[(size_t) di];   // (a pack whose sources are not index sources: none, zeros)
++            if (ckv == nullptr) {
++                err = "source layer " + std::to_string(s.layer) + "'s rows are not on its device";
++                return 0;
++            }
++            const size_t cb = (size_t) rows * ckv_rb(), ib = (size_t) rows * ik_rb();
++            cudaSetDevice(devs[(size_t) di].id);
++            if (cudaMemcpy(p + off, ckv, cb, cudaMemcpyDeviceToHost) != cudaSuccess ||
++                (ik != nullptr && cudaMemcpy(p + off + cb, ik, ib, cudaMemcpyDeviceToHost) != cudaSuccess)) {
++                err = "source layer " + std::to_string(s.layer) + "'s compressed KV: " + cudaGetErrorString(cudaGetLastError());
++                return 0;
++            }
++            off += cb + ib;
++        }
++        if (off + 8 != out.size()) {
++            err = "the state's size does not add up";
++            return 0;
++        }
++        put(&kSlotMagic, 8);
++        slot_held = true;
++        return (uint64_t) off;
++    }
++
++    bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {
++        size_t off = 0;
++        bool wrote = false, ok = false;
++        // a load that stops after some of another conversation's state went into the layers leaves a state no
++        // checkpoint can repair: it is reset (the prompt is read from token 0), never served from the mix
++        struct FailClosed {
++            Impl& p;
++            const bool& wrote;
++            const bool& ok;
++            ~FailClosed() {
++                if (!ok && wrote) p.reset();
++            }
++        } guard{*this, wrote, ok};
++        const auto room = [&](size_t b) { return b <= bytes && off <= bytes - b; };
++        uint64_t magic = 0, il = 0, n = 0;
++        if (!room(16)) {
++            err = "the slot is cut short";
++            return false;
++        }
++        std::memcpy(&magic, data + off, 8);
++        std::memcpy(&il, data + off + 8, 8);
++        off += 16;
++        if (magic != kSlotMagic || il == 0 || il > (1u << 20)) {
++            err = "not a saved conversation";
++            return false;
++        }
++        if (!room((size_t) il + 8)) {
++            err = "the slot is cut short";
++            return false;
++        }
++        {
++            std::string id((size_t) il, '\0');
++            std::memcpy(id.data(), data + off, (size_t) il);
++            off += (size_t) il;
++            std::memcpy(&n, data + off, 8);
++            off += 8;
++            if (id != slot_identity()) {
++                err = "another model's, or another engine version's, conversation";
++                return false;
++            }
++        }
++        if (n != (uint64_t) n_pos || n_pos <= 0 || n_pos > o.max_context || !room((size_t) n * 4)) {
++            err = "the conversation's position is not this prompt's";
++            return false;
++        }
++        std::vector<int32_t> toks_in((size_t) n);
++        std::memcpy(toks_in.data(), data + off, (size_t) n * 4);
++        off += (size_t) n * 4;
++        for (Dev& d : devs) {   // (their work ends before the state is written over)
++            cudaSetDevice(d.id);
++            cudaStreamSynchronize(d.st);
++        }
++        for (size_t i = 0; i < L.size(); ++i) {
++            Layer& l = L[i];
++            const Dev& d = devs[(size_t) l.dev];
++            cudaSetDevice(d.id);
++            uint64_t wb = 0, cn = 0;
++            if (!room(8)) {
++                err = "the slot is cut short";
++                return false;
++            }
++            std::memcpy(&wb, data + off, 8);
++            off += 8;
++            if (wb != (uint64_t) g.win * win_rb() || !room((size_t) wb + 8)) {
++                err = l.name + "window ring of another size";
++                return false;
++            }
++            wrote = true;
++            for (int m = 0; m < l.nm; ++m) {
++                Layer& lm = member(l, m);
++                if (cudaMemcpy(lm.win, data + off, (size_t) wb, cudaMemcpyHostToDevice) != cudaSuccess) {
++                    err = l.name + "window ring: " + cudaGetErrorString(cudaGetLastError());
++                    return false;
++                }
++            }
++            off += (size_t) wb;
++            std::memcpy(&cn, data + off, 8);
++            off += 8;
++            if (cn != (l.c_kv ? (uint64_t) l.ratio * (uint64_t) g.hd : 0)) {
++                err = l.name + "compressor's group of another size";
++                return false;
++            }
++            if (cn > 0) {
++                const size_t cb = (size_t) cn * 4;
++                if (!room(2 * cb)) {
++                    err = "the slot is cut short";
++                    return false;
++                }
++                for (int m = 0; m < l.nm; ++m) {
++                    Layer& lm = member(l, m);
++                    if (cudaMemcpy(lm.c_kv, data + off, cb, cudaMemcpyHostToDevice) != cudaSuccess ||
++                        cudaMemcpy(lm.c_score, data + off + cb, cb, cudaMemcpyHostToDevice) != cudaSuccess) {
++                        err = l.name + "compressor's group: " + cudaGetErrorString(cudaGetLastError());
++                        return false;
++                    }
++                }
++                off += 2 * cb;
++            }
++        }
++        for (const Src& s : srcs) {
++            uint64_t rows = 0;
++            if (!room(8)) {
++                err = "the slot is cut short";
++                return false;
++            }
++            std::memcpy(&rows, data + off, 8);
++            off += 8;
++            if (rows != (uint64_t) (n_pos / std::max(1, s.ratio))) {
++                err = "source layer " + std::to_string(s.layer) + "'s rows are not this conversation's";
++                return false;
++            }
++            if (rows == 0) continue;
++            const size_t cb = (size_t) rows * ckv_rb(), ib = (size_t) rows * ik_rb();
++            if (!room(cb + ib)) {
++                err = "the slot is cut short";
++                return false;
++            }
++            for (size_t di = 0; di < devs.size(); ++di) {
++                if (s.ckv[di] == nullptr && s.ik[di] == nullptr) continue;
++                cudaSetDevice(devs[di].id);
++                if (s.ckv[di] != nullptr && cudaMemcpy(s.ckv[di], data + off, cb, cudaMemcpyHostToDevice) != cudaSuccess) {
++                    err = "source layer " + std::to_string(s.layer) + "'s compressed KV: " + cudaGetErrorString(cudaGetLastError());
++                    return false;
++                }
++                if (s.ik[di] != nullptr &&
++                    cudaMemcpy(s.ik[di], data + off + cb, ib, cudaMemcpyHostToDevice) != cudaSuccess) {
++                    err = "source layer " + std::to_string(s.layer) + "'s index keys: " + cudaGetErrorString(cudaGetLastError());
++                    return false;
++                }
++            }
++            off += cb + ib;
++        }
++        uint64_t end = 0;
++        if (!room(8)) {
++            err = "the slot is cut short";
++            return false;
++        }
++        std::memcpy(&end, data + off, 8);
++        off += 8;
++        if (end != kSlotMagic) {
++            err = "the slot does not end where it should";
++            return false;
++        }
++        pos = n_pos;
++        toks.swap(toks_in);
++        ctoks.resize((size_t) pos);
++        for (size_t i = 0; i < (size_t) pos; ++i)
++            ctoks[i] = toks[i] < pk.eg_vocab ? pk.eg_map[(size_t) toks[i]] : 0;
++        ck[0].pos = ck[1].pos = -1;   // (the checkpoints hold the state this one replaced)
++        slot_held = false;
++        ok = true;
++        return true;
++    }
++
++    std::string slot_identity() const {
++        const auto size_of = [](const std::string& p) {
++            std::error_code ec;
++            const auto s = std::filesystem::file_size(p, ec);
++            return ec ? 0ull : (unsigned long long) s;
++        };
++        std::ostringstream id;
++        id << "maya-ds4-session-1 engine=" << STRATA_VERSION << " mtp=" << g.n_mtp << " dim=" << g.dim << " hd=" << g.hd
++           << " win=" << g.win << " ratios=";
++        for (int r : g.ratios) id << r << ",";
++        id << " kv=";
++        for (int v : g.kv_src) id << v << ",";
++        id << " ix=";
++        for (int v : g.ix_src) id << v << ",";
++        id << " ds4.txt:" << size_of(pk.dir + "/ds4.txt") << " engram.bin:" << size_of(pk.dir + "/engram.bin")
++           << " tensors.txt:" << size_of(pk.dir + "/tensors.txt");
++        for (size_t i = 0; i < pk.files.size(); ++i)
++            id << " " << pk.files[i] << ":" << os::file_size(pk.fds[i]);
++        return id.str();
++    }
++
+     size_t bounce_bytes() const {
+         return (size_t) kWin * ((size_t) g.hc * g.dim * 4 + 8 * 4 + topk_stride() * 4 + cand_stride() * 4);
+     }
+@@ -8271,6 +8557,7 @@ struct Model::Impl {
+         pos = p0 + keep;
+         toks.resize((size_t) pos);
+         ctoks.resize((size_t) pos);
++        slot_held = false;
+     }
+ 
+     // ---- a window: T tokens at positions pos .. pos + T - 1 through every layer; the logits of its last `logits` rows
+@@ -10099,6 +10386,7 @@ struct Model::Impl {
+                 return false;
+             }
+         const int64_t p0 = pos;
++        slot_held = false;   // (the state grows now: what slot_save took is no longer the conversation)
+         for (int t = 0; t < T; ++t) {
+             toks.push_back(tk[t]);
+             ctoks.push_back(ctok(pos + t, tk[t]));
+@@ -11052,6 +11340,11 @@ void Model::reset() { p_->reset(); }
+ void Model::checkpoint(int slot) { p_->checkpoint(slot); }
+ bool Model::restore(int64_t limit) { return p_->restore(limit); }
+ int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }
++uint64_t Model::slot_save(std::vector<uint8_t>& out, std::string& err) { return p_->slot_save(out, err); }
++bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {
++    return p_->slot_load(data, bytes, n_pos, err);
++}
++std::string Model::slot_identity() const { return p_->slot_identity(); }
+ void Model::save_profile() const { p_->save_profile(); }
+ const Stats& Model::stats() const { return p_->st; }
+ std::string Model::describe() const { return p_->describe(); }
+diff --git a/src/ds4/ds4_model.hpp b/src/ds4/ds4_model.hpp
+index 79741e4..ba83a58 100644
+--- a/src/ds4/ds4_model.hpp
++++ b/src/ds4/ds4_model.hpp
+@@ -6,7 +6,9 @@
+ // its own 128-token window, the compressed groups completed by its position.  The state a token leaves is the
+ // 128-token window ring of every layer, the compressors' partial groups, the compressed KV and index keys of the KV
+ // source layers (append-only), and the Engram n-gram history; checkpoint() / restore() keep the first two (the rest is
+-// truncated by position) so a conversation can go back to the end of its last prompt.
++// truncated by position) so a conversation can go back to the end of its last prompt.  A conversation that leaves the
++// model altogether (another chat answered in between) is a slot: slot_save / slot_load take the same state - the
++// compressed KV and index keys included, which a checkpoint leaves in place - through a file or a host buffer.
+ #pragma once
+ 
+ #include <cstddef>
+@@ -157,6 +159,18 @@ public:
+     bool restore(int64_t limit);
+     int64_t restorable(int64_t limit) const;
+ 
++    /// The conversation in the model into `out` (slot_save): its position, its tokens, every window ring (the DSpark
++    /// blocks' included), the compressors' partial groups and each KV source's compressed KV and index keys up to it,
++    /// the pieces the state a prompt continues is made of.  0 and err: nothing was set aside (it holds pictures, there
++    /// is no conversation, or the conversation is already set aside - unchanged since).
++    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err);
++    /// `data` (a slot's bytes) back into the model: the state at the slot's position n_pos, as slot_save took it -
++    /// what a prompt that continues the slot's tokens reads on from (the caller checked the tokens are a prefix).
++    bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err);
++    /// What a saved conversation must match: this engine's version, this model's geometry and files and the drafter's
++    /// blocks - a slot naming anything else is not this model's state (a file's .meta says so; slot_load refuses).
++    std::string slot_identity() const;
++
+     /// The vision tower: the token every position of an image's span carries (-1: no tower).
+     int image_token() const;
+     /// An image's pixels (RGB rows, width x height, both multiples of the patch size: the server's resize) -> the
+diff --git a/tools/ds4/slot_keep_test.py b/tools/ds4/slot_keep_test.py
+new file mode 100644
+index 0000000..9689e2f
+--- /dev/null
++++ b/tools/ds4/slot_keep_test.py
+@@ -0,0 +1,417 @@
++#!/usr/bin/env python3
++"""tools/ds4/slot_keep_test.py - the kept conversations (MAYA_DS4_SLOT_KEEP): a prompt that does not continue the
++conversation in the model takes the kept one it does continue back, so A, B, A's next turn reads only the new tokens.
++
++    python tools/ds4/slot_keep_test.py --pack /mnt/data/models/.../maya-ds4 [--exe build/maya-ds4] [--gpus 0,2,1]
++
++Six runs of the engine's `--serve` protocol (greedy, spec=0 so the state's position is the answer's, exactly):
++  no-keep  A, B, A's next turn (MAYA_DS4_SLOT_KEEP=0)  the reference: reused 0, and its answer to A builds the turn
++                                                       every later run sends, so they all send the same prompt byte
++                                                       for byte
++  no-keep  the same again, a second process            two full reads of that one prompt: the engine's own run-to-run
++                                                       determinism (a prompt's path is not promised to be identical
++                                                       across runs, so this is measured, not assumed)
++  in-run   A, B, A's next turn, one process            the third request reports A's full prefix as reused
++  kept     A, B, then QUIT                             the folder keeps both conversations (2 .bin + .meta, under a
++                                                       0.05 GB MAYA_DS4_SLOT_GB)
++  restart  A's next turn alone, a new process          the same prefix reused, from the folder
++  evict    A, B, C into a folder capped at A+B's bytes three conversations cannot fit: the least recently used (A) is
++                                                       gone, B and C stay
++
++The prompts are real text - this repo's tokenizer corpus, tokenized through the pack's tokenizer - not random ids:
++random ids draw near-tie logits, where two greedy runs print different tokens and nothing can be compared.  spec=0 is
++deliberate: with the drafter a request's state can end a few tokens past its last printed one (a draft accepted before
++max_new cut it), and the next prompt - which has only the printed answer - would then not be a prefix of it; the slot
++would not be taken and the count would say so.  The state itself is the same either way (the drafter's blocks are in
++it).
++
++The greedy check: when two full no-keep reads of the same prompt agree, the slot runs must print the reference's
++tokens; when they do not, the engine's prompt path is not run-to-run deterministic, and the slot runs are compared
++against both reads instead of claiming identity.  The reuse counts are only claimed for a run whose own answer to A
++is the reference's (the prompt's answer is the reference's, so another answer is not continued past the common part).
++
++Exit 0: every check passed.  1: a check failed (the reason is printed).  2: the engine did not start or
++answer, or the pack's tokenizer is missing.
++"""
++from __future__ import annotations
++
++import argparse
++import os
++import select
++import shutil
++import struct
++import subprocess
++import sys
++import tempfile
++import time
++from typing import Callable
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++try:
++    from strata_tokenizer import Tokenizer  # noqa: E402
++except ImportError as e:   # (tools/strata_tokenizer.py's own: `regex`)
++    sys.exit(f"the tokenizer cannot be imported: {e} (pip install regex)")
++
++CORPUS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tokenizer_corpus.txt")
++META_MAGIC = 0x314154454d345344   # "DS4META1" (little endian): a slot's .meta, as src/ds4/ds4_main.cpp writes it
++
++
++def text_tokens(tok: Tokenizer, salt: str, n: int) -> list[int]:
++    """`n` tokens of real text: the corpus's passages, each numbered under `salt` (so two prompts diverge at their
++    first words), repeated until long enough and cut at `n`."""
++    with open(CORPUS, encoding="utf-8", newline="") as f:   # (CRLF kept: the tokenizer's boundaries depend on it)
++        text = f.read()
++    out: list[int] = []
++    i = 0
++    while len(out) < n:
++        out += tok.encode(f"{salt} {i}.\n{text}\n", parse_special=False)
++        i += 1
++    return out[:n]
++
++
++def meta_tokens(path: str) -> list[int] | None:
++    """A slot's .meta, as the engine writes it: the magic, its identity (length, bytes), the state's size, its tokens,
++    the magic again.  False: not one of the engine's .meta files, or damaged."""
++    try:
++        with open(path, "rb") as f:
++            data = f.read()
++        m0, il = struct.unpack_from("<QQ", data, 0)
++        if m0 != META_MAGIC:
++            return None
++        size, nt = struct.unpack_from("<QQ", data, 16 + il)
++        toks = list(struct.unpack_from("<%di" % nt, data, 32 + il))
++        (m1,) = struct.unpack_from("<Q", data, 32 + il + 4 * nt)
++    except (OSError, struct.error):
++        return None
++    return toks if m1 == META_MAGIC else None
++
++
++class Engine:
++    """One `maya-ds4 --serve` process: its INFO/READY lines, then `GEN` in, `T` / `DONE` out."""
++
++    def __init__(self, exe: str, args: list[str], env: dict):
++        self.exe, self.args, self.env = exe, args, env
++        self.notes: list[str] = []      # every NOTE line the engine printed (the slots' own lines too)
++        self.proc = None
++        self.err = None
++        self.err_path = ""
++        self.buffer = b""
++        self.ready = ""
++
++    def start(self, timeout: float) -> None:
++        env = dict(os.environ)
++        env.update(self.env)
++        fd, self.err_path = tempfile.mkstemp(prefix="ds4-slots-err-")
++        self.err = os.fdopen(fd, "wb")
++        self.proc = subprocess.Popen([self.exe, *self.args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++                                     stderr=self.err, env=env, bufsize=0)
++        end = time.monotonic() + timeout
++        while True:
++            line = self._line(end)
++            if line.startswith("READY "):
++                self.ready = line
++                return
++            if line.startswith("NOTE "):
++                self.notes.append(line[5:].strip())
++            elif line.startswith("ERR "):
++                raise RuntimeError("the engine refused to start: " + line)
++
++    def _line(self, end: float) -> str:
++        while b"\n" not in self.buffer:
++            left = end - time.monotonic()
++            if left <= 0:
++                raise RuntimeError("the engine did not answer in time")
++            if self.proc.poll() is not None:
++                raise RuntimeError(f"the engine ended (exit {self.proc.returncode})")
++            r, _, _ = select.select([self.proc.stdout], [], [], min(left, 1.0))
++            if not r:
++                continue
++            chunk = os.read(self.proc.stdout.fileno(), 1 << 16)
++            if not chunk:
++                raise RuntimeError("the engine's output ended")
++            self.buffer += chunk
++        line, self.buffer = self.buffer.split(b"\n", 1)
++        return line.decode("utf-8", "replace").strip()
++
++    def request(self, prompt: list[int], max_new: int, spec: int = 0, timeout: float = 3600.0) -> dict:
++        self.proc.stdin.write(f"GEN {max_new} spec={spec} {','.join(str(t) for t in prompt)}\n".encode())
++        self.proc.stdin.flush()
++        out = {"tokens": [], "reused": None, "prompt": None, "finish": None, "s": 0.0}
++        t0 = time.monotonic()
++        end = t0 + timeout
++        while True:
++            line = self._line(end)
++            if line.startswith("T "):
++                out["tokens"].append(int(line[2:]))
++            elif line.startswith("ERR "):
++                out["error"] = line[4:]
++                out["s"] = time.monotonic() - t0
++                return out
++            elif line.startswith("DONE "):
++                f = line.split()
++                out["generated"], out["prompt"], out["finish"] = int(f[1]), int(f[2]), f[5]
++                out["reused"] = int(f[8])
++                out["s"] = time.monotonic() - t0
++                return out
++            elif line.startswith("NOTE "):
++                self.notes.append(line[5:].strip())
++
++    def quit(self, timeout: float = 300.0) -> None:
++        try:
++            self.proc.stdin.write(b"QUIT\n")
++            self.proc.stdin.flush()
++        except OSError:
++            pass
++        end = time.monotonic() + timeout
++        while time.monotonic() < end and self.proc.poll() is None:
++            r, _, _ = select.select([self.proc.stdout], [], [], 0.2)
++            if not r:
++                continue
++            chunk = os.read(self.proc.stdout.fileno(), 1 << 16)
++            if not chunk:
++                break
++            self.buffer += chunk
++            while b"\n" in self.buffer:
++                line, self.buffer = self.buffer.split(b"\n", 1)
++                line = line.decode("utf-8", "replace").strip()
++                if line.startswith("NOTE "):
++                    self.notes.append(line[5:].strip())
++        try:
++            self.proc.wait(timeout=max(1.0, end - time.monotonic()))
++        except subprocess.TimeoutExpired:
++            self.proc.kill()
++            raise RuntimeError("the engine did not end after QUIT")
++
++    def stderr_lines(self) -> list[str]:
++        """The engine's stderr once it has ended (run() checks its `ds4 slots:` lines: a slot that failed to be set
++        aside, taken back or written is a failure of this test, not a log line)."""
++        if not self.err_path:
++            return []
++        try:
++            self.err.close()
++        except (OSError, AttributeError):
++            pass
++        with open(self.err_path, encoding="utf-8", errors="replace") as f:
++            lines = f.read().splitlines()
++        try:
++            os.unlink(self.err_path)
++        except OSError:
++            pass
++        return lines
++
++
++def run(exe: str, gpus: list[int], pack: str, ctx: int, slots: str, keep: bool, steps: list[tuple[str, Callable]],
++        max_new: int, slot_gb: float | None = None) -> tuple[dict, list[str], float]:
++    """One engine process: each step (a name, and a function of the answers so far that gives its prompt) in order."""
++    env = {"MAYA_DS4_SLOT_KEEP": "1" if keep else "0", "MAYA_DS4_SLOT_DIR": slots}
++    if slot_gb is not None:
++        env["MAYA_DS4_SLOT_GB"] = str(slot_gb)
++    args = [*(("--gpus", ",".join(str(g) for g in gpus)) if gpus else ()), "--pack", pack, "--max-context", str(ctx),
++            "--dspark", "on", "--threads", "on", "--vision", "off", "--expert-profile", "none", "--serve"]
++    eng = Engine(exe, args, env)
++    t0 = time.monotonic()
++    answers: dict[str, dict] = {}
++    try:
++        eng.start(timeout=1800.0)
++        load_s = time.monotonic() - t0
++        for name, make in steps:
++            prompt = make(answers)
++            answers[name] = eng.request(prompt, max_new)
++            if "error" in answers[name]:
++                raise RuntimeError(f"{name}: {answers[name]['error']}")
++            answers[name]["len"] = len(prompt)
++    finally:
++        if eng.proc is not None:
++            eng.quit()
++        err = eng.stderr_lines()
++    for line in err:   # (a slot that failed to be set aside, taken back or written: this test's failure, not a log line)
++        if line.startswith("ds4 slots:") and "failed" in line:
++            raise RuntimeError("the engine: " + line)
++    return answers, eng.notes, load_s
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description="the kept conversations (MAYA_DS4_SLOT_KEEP): A, B, then A's next turn")
++    ap.add_argument("--pack", required=True, help="the model's pack dir (maya-ds4)")
++    ap.add_argument("--exe", default=os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
++        os.path.abspath(__file__)))), "build", "maya-ds4"), help="the engine (default: <repo>/build/maya-ds4)")
++    ap.add_argument("--gpus", default="", help="the GPUs (default: every visible one, the engine's own split)")
++    ap.add_argument("--ctx", type=int, default=32768, help="--max-context")
++    ap.add_argument("--len-a", type=int, default=12000, help="A's prompt (tokens)")
++    ap.add_argument("--len-b", type=int, default=9000, help="B's prompt (tokens)")
++    ap.add_argument("--len-c", type=int, default=4000, help="C's prompt (tokens, the eviction run; shorter than A, so "
++                                                             "B and C fit under A+B's bytes once A is gone)")
++    ap.add_argument("--len-turn", type=int, default=64, help="A's next turn's new tokens")
++    ap.add_argument("--max-new", type=int, default=24, help="the answers' length (greedy)")
++    a_ = ap.parse_args()
++
++    if not os.path.exists(a_.exe):
++        print(f"{a_.exe}: no engine - build it first (cmake --build build --target maya-ds4)", flush=True)
++        return 2
++    try:
++        tok = Tokenizer.from_dir(os.path.join(a_.pack, "tokenizer"))
++    except (OSError, ValueError) as e:
++        print(f"{os.path.join(a_.pack, 'tokenizer')}: no tokenizer (the prompts are real text): {e}", flush=True)
++        return 2
++    a = text_tokens(tok, "Conversation A.", a_.len_a)
++    b = text_tokens(tok, "Conversation B.", a_.len_b)
++    c = text_tokens(tok, "Conversation C.", a_.len_c)
++    turn = text_tokens(tok, "The next turn:", a_.len_turn)
++    gpus = [int(g) for g in a_.gpus.split(",") if g.strip()]
++    max_new = a_.max_new
++    ok = True
++
++    def check(what: str, cond: bool) -> None:
++        nonlocal ok
++        print(("  ok    " if cond else "  FAIL  ") + what, flush=True)
++        ok = ok and cond
++
++    def print_diff(name: str, x: list[int], y: list[int]) -> None:
++        d = next((i for i, (p, q) in enumerate(zip(x, y)) if p != q), min(len(x), len(y)))
++        print(f"        {name}: token {d}: {x[d:d + 4]} vs {y[d:d + 4]}", flush=True)
++
++    tmp = tempfile.mkdtemp(prefix="ds4-slots-")
++    dir_inrun = os.path.join(tmp, "in-run")
++    dir_kept = os.path.join(tmp, "kept")
++    dir_evict = os.path.join(tmp, "evict")
++    try:
++        print("no-keep: A, B, A's next turn, one process (MAYA_DS4_SLOT_KEEP=0, the reference)", flush=True)
++        r0, _, _ = run(a_.exe, gpus, a_.pack, a_.ctx, os.path.join(tmp, "off-1"), False,
++                       [("A", lambda _: a), ("B", lambda _: b),
++                        ("A-turn", lambda ans: a + ans["A"]["tokens"] + turn)], max_new)
++        ref, ref_a = r0["A-turn"], r0["A"]["tokens"]
++        print(f"        A {len(a)} tok in {r0['A']['s']:.0f} s, B {len(b)} tok in {r0['B']['s']:.0f} s; A's next turn "
++              f"{ref['len']} tok in {ref['s']:.0f} s, reused {ref['reused']}", flush=True)
++        check(f"no-keep: without slots the turn starts over (reused {ref['reused']})", ref["reused"] == 0)
++
++        print("no-keep: the same prompts once more, a second process (the engine's own run-to-run prompt path)",
++              flush=True)
++        r0b, _, _ = run(a_.exe, gpus, a_.pack, a_.ctx, os.path.join(tmp, "off-2"), False,
++                        [("A", lambda _: a), ("B", lambda _: b), ("A-turn", lambda _: a + ref_a + turn)], max_new)
++        ref2 = r0b["A-turn"]
++        same_a = r0b["A"]["tokens"] == ref_a
++        same_turn = ref2["tokens"] == ref["tokens"]
++        print(f"        A's own answer {'matched' if same_a else 'DIFFERED from'} the reference's "
++              f"({len(ref_a)} tokens); the next turn's tokens {'matched' if same_turn else 'DIFFERED'}", flush=True)
++        if not same_a:
++            print_diff("the second read's A answer vs the reference's", r0b["A"]["tokens"], ref_a)
++        if not same_turn:
++            print_diff("the second read's turn vs the reference's", ref2["tokens"], ref["tokens"])
++        deterministic = same_a and same_turn
++        if not deterministic:
++            print("        the engine's prompt path is not run-to-run deterministic: two full no-keep reads of the "
++                  "same prompt differ - the slot runs are compared against both, not claimed identical to one",
++                  flush=True)
++
++        def a_answer(name: str, x: dict) -> None:
++            print(f"        {name}: A's own answer {'matched' if x['A']['tokens'] == ref_a else 'DIFFERED from'} the "
++                  f"reference's ({len(x['A']['tokens'])} tokens)", flush=True)
++
++        def reuse_check(name: str, got: int, ans: list[int]) -> None:
++            # (the state the run holds is A and all but the answer's last fed token: the reference's prompt continues
++            #  exactly that - when the run's own answer is the reference's)
++            if ans == ref_a:
++                check(f"{name}: reuses A's full prefix ({got} of {len(a) + len(ref_a) - 1})",
++                      got == len(a) + len(ref_a) - 1)
++            else:
++                print(f"        {name}: its answer to A is not the reference's, so the reference's prompt is not "
++                      f"continued by it past the common part - reused {got}, not claimed", flush=True)
++
++        print("in-run: A, B, A's next turn, one process (the slots in RAM)", flush=True)
++        r1, _, load1 = run(a_.exe, gpus, a_.pack, a_.ctx, dir_inrun, True,
++                           [("A", lambda _: a), ("B", lambda _: b), ("A-turn", lambda _: a + ref_a + turn)], max_new)
++        an, third = r1["A"], r1["A-turn"]
++        print(f"        load {load1:.0f} s; A {len(a)} tok in {r1['A']['s']:.0f} s, B {len(b)} tok in "
++              f"{r1['B']['s']:.0f} s; A's next turn {third['len']} tok in {third['s']:.1f} s, reused {third['reused']}",
++              flush=True)
++        a_answer("in-run", r1)
++        reuse_check("in-run", third["reused"], an["tokens"])
++        check(f"in-run: the prompt's length agrees ({third['prompt']} of {third['len']})",
++              third["prompt"] == third["len"])
++
++        print("kept: A, B, then QUIT (both conversations written to the folder)", flush=True)
++        rk, _, _ = run(a_.exe, gpus, a_.pack, a_.ctx, dir_kept, True,
++                       [("A", lambda _: a), ("B", lambda _: b)], max_new, slot_gb=0.05)
++        a_answer("kept", rk)
++        bins = [f for f in os.listdir(dir_kept) if f.startswith("slot-") and f.endswith(".bin")]
++        metas = [f for f in os.listdir(dir_kept) if f.startswith("slot-") and f.endswith(".meta")]
++        check(f"kept: the folder holds A and B ({len(bins)} .bin, {len(metas)} .meta)",
++              len(bins) == 2 and len(metas) == 2)
++        size = sum(os.path.getsize(os.path.join(dir_kept, f)) for f in bins)
++        check(f"kept: the folder stays under MAYA_DS4_SLOT_GB=0.05 ({size / 2**20:.1f} MiB)", size <= 0.05 * 2**30)
++
++        def folder_slots(path: str) -> dict[str, int]:
++            """A folder's conversations by the prompt their tokens start with ({name: the .bin's bytes})."""
++            out: dict[str, int] = {}
++            for fn in sorted(os.listdir(path)):
++                if not fn.endswith(".meta"):
++                    continue
++                toks = meta_tokens(os.path.join(path, fn))
++                binpath = os.path.join(path, fn[:-5] + ".bin")
++                if toks is None or not os.path.exists(binpath):
++                    continue
++                for name, prompt in (("A", a), ("B", b), ("C", c)):
++                    if len(toks) >= len(prompt) and toks[:len(prompt)] == prompt:
++                        out[name] = os.path.getsize(binpath)
++            return out
++
++        kept_slots = folder_slots(dir_kept)
++        check(f"kept: the folder holds A and B ('{', '.join(sorted(kept_slots)) or 'nothing'}')",
++              sorted(kept_slots) == ["A", "B"])
++
++        print("restart: A's next turn alone, a new process (the folder's slots)", flush=True)
++        r2, notes2, _ = run(a_.exe, gpus, a_.pack, a_.ctx, dir_kept, True,
++                            [("A-turn", lambda _: a + ref_a + turn)], max_new)
++        sr = r2["A-turn"]
++        kept = [n for n in notes2 if "kept from earlier runs" in n]
++        print(f"        {kept[0] if kept else '(no kept line)'}; reused {sr['reused']} in {sr['s']:.1f} s", flush=True)
++        reuse_check("restart", sr["reused"], rk["A"]["tokens"])
++        check(f"restart: the prompt's length agrees ({sr['prompt']} of {sr['len']})", sr["prompt"] == sr["len"])
++
++        if sorted(kept_slots) != ["A", "B"]:
++            raise RuntimeError("the kept folder does not hold A and B: the eviction check's cap needs their bytes")
++        # the folder's A+B bytes: three conversations cannot fit under them, so the third write must take A (its
++        # least recently used) away - and B and C fit once it is (C is shorter than A)
++        cap_gb = (kept_slots["A"] + kept_slots["B"]) / 2**30
++        print(f"evict: A, B, C into a folder capped at A+B's bytes, {cap_gb:.3f} GB (three cannot fit)", flush=True)
++        r4, _, _ = run(a_.exe, gpus, a_.pack, a_.ctx, dir_evict, True,
++                       [("A", lambda _: a), ("B", lambda _: b), ("C", lambda _: c)], max_new, slot_gb=cap_gb)
++        a_answer("evict", r4)
++        evict_slots = folder_slots(dir_evict)
++        print(f"        the folder holds '{', '.join(sorted(evict_slots)) or 'nothing'}' "
++              f"({sum(evict_slots.values()) / 2**20:.1f} MiB of the {cap_gb * 2**30 / 2**20:.1f} MiB cap)", flush=True)
++        check("evict: the least recently used (A) is gone", "A" not in evict_slots)
++        check("evict: the newest (C) is kept", "C" in evict_slots)
++        check("evict: B stays (A's bytes made room for C)", "B" in evict_slots)
++        check(f"evict: the folder stays under the cap ({sum(evict_slots.values())} of {round(cap_gb * 2**30)} bytes)",
++              sum(evict_slots.values()) <= cap_gb * 2**30)
++
++        if deterministic:
++            check(f"greedy: in-run's {len(ref['tokens'])} tokens are the reference's", third["tokens"] == ref["tokens"])
++            check(f"greedy: restart's {len(ref['tokens'])} tokens are the reference's", sr["tokens"] == ref["tokens"])
++            if third["tokens"] != ref["tokens"]:
++                print_diff("in-run vs the reference", third["tokens"], ref["tokens"])
++            if sr["tokens"] != ref["tokens"]:
++                print_diff("restart vs the reference", sr["tokens"], ref["tokens"])
++        else:
++            for name, x in (("in-run", third), ("restart", sr)):
++                match = [what for what, y in (("the reference's", ref), ("the second read's", ref2))
++                         if x["tokens"] == y["tokens"]]
++                print(f"        {name}: {len(x['tokens'])} tokens, "
++                      f"{'the same as ' + ' and '.join(match) if match else 'the same as neither no-keep read'}",
++                      flush=True)
++                if not match:
++                    print_diff(f"{name} vs the reference", x["tokens"], ref["tokens"])
++                check(f"greedy: {name}'s tokens are one of the two no-keep reads' ({', '.join(match) or 'neither'})",
++                      bool(match))
++    except (RuntimeError, OSError) as e:
++        print(f"FAIL: {e}", flush=True)
++        ok = False
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++    print("PASS: the kept conversations read on from their state" if ok else "FAIL", flush=True)
++    return 0 if ok else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())

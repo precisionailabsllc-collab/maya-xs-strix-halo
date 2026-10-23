@@ -1,0 +1,39 @@
+From e2bf38cafc43ff01e343a3fc6c599f662122664f Mon Sep 17 00:00:00 2001
+From: Hermes <rj@hermes.local>
+Date: Wed, 21 Oct 2026 17:08:31 -0400
+Subject: [PATCH 5/9] ds4: DS4_PREFIX_STRIDE=0 means no cap, not a 16-token run
+
+max(16, atoi(v)) turned the documented "0 keeps the runs at feed_unit" into a 16-token
+run: an 8K prompt then read its experts again per run (8.7 tok/s against 232.3 for the
+same prompt with the cap off, measured on the Strix Halo). Parse 0 (and any negative) as
+no cap.
+
+(cherry picked from commit 347c31574617543c61e1fbe371fabe398631caab)
+---
+ src/ds4/ds4_main.cpp | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/src/ds4/ds4_main.cpp b/src/ds4/ds4_main.cpp
+index 2215f3a..9f0bb57 100644
+--- a/src/ds4/ds4_main.cpp
++++ b/src/ds4/ds4_main.cpp
+@@ -479,10 +479,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
+         static const bool prefix_reuse = std::getenv("DS4_PREFIX_REUSE") == nullptr ||
+                                          std::atoi(std::getenv("DS4_PREFIX_REUSE")) != 0;
+         constexpr int kRunDefault = 4096;
+-        static const size_t prefix_stride =
+-            std::getenv("DS4_PREFIX_STRIDE")
+-                ? (size_t) std::max(16, std::atoi(std::getenv("DS4_PREFIX_STRIDE")))
+-                : (prefix_reuse ? (size_t) kRunDefault : (size_t) 0);
++        // (0 - and "0" - means no cap: the run stays at feed_unit. Before this, "0" parsed through max(16, 0) into a
++        //  16-token run: an 8K prompt then ran as ~490 runs, which read the experts again per run - 8.7 tok/s against
++        //  232 for the same prompt uncapped, measured on this Strix Halo.)
++        static const size_t prefix_stride = [] {
++            const char* v = std::getenv("DS4_PREFIX_STRIDE");
++            if (v == nullptr) return prefix_reuse ? (size_t) kRunDefault : (size_t) 0;
++            const int n = std::atoi(v);
++            return n > 0 ? (size_t) std::max(16, n) : (size_t) 0;
++        }();
+         static int mark_slot = 0;   // rotates over the mark slots, across requests
+         auto mark = [&] {
+             if (!prefix_reuse) return;

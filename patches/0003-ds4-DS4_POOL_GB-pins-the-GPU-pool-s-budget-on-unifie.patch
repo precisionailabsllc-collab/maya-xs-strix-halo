@@ -1,0 +1,48 @@
+From b364775de4afa373654099906b9b87457679bc85 Mon Sep 17 00:00:00 2001
+From: OpenCode <rj@precisionailabs.com>
+Date: Tue, 20 Oct 2026 16:25:46 -0400
+Subject: [PATCH 3/9] ds4: DS4_POOL_GB pins the GPU pool's budget on
+ unified-memory APUs
+
+HIP's hipMemGetInfo on a Strix Halo APU reports the GTT pool rather than what the
+host can actually give, and the number swings per process: the same 128 GB box
+reported 48.0, 51.3 and 120.0 GB free within one afternoon, and the pool the
+engine sized from it ranged 22.9 - 63 GB for the same flags. A 22.9 GB pool costs
+about 10x decode speed (1766 vs 3828 of 15744 experts resident, 1.75 vs 17.9
+tok/s measured), so the pool is not reproducible run to run.
+
+DS4_POOL_GB=<GB> sets the budget the experts, weights and caches may take
+together on each device, replacing the measured free memory. Unset, behaviour is
+unchanged.
+
+(cherry picked from commit 008b40fa6857fe5946978240dbcc8d4f45554f71)
+(cherry picked from commit 0d1ff8f799885a1a4c9c73c8d1764e2f0b9782bf)
+(cherry picked from commit c634d0d929b89832fea55fef8c4036e5bb70aef1)
+---
+ src/ds4/ds4_model.cu | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/ds4/ds4_model.cu b/src/ds4/ds4_model.cu
+index dab13e1..f7c99cc 100644
+--- a/src/ds4/ds4_model.cu
++++ b/src/ds4/ds4_model.cu
+@@ -2313,6 +2313,19 @@ struct Model::Impl {
+                 return false;
+             }
+             CK(mem_info(&d.free0, &d.total));
++            // (an APU: HIP's free swings with the host's page cache - 48 GB and 120 GB for the same process on a
++            //  128 GB Strix Halo, minutes apart - so the GPU pool and the read-ahead it sizes are not reproducible.
++            //  DS4_POOL_GB pins the budget the pool is sized from; it is what the experts, the weights and their
++            //  caches may take together, on this device.  Upstream's mem_info() measures the dedicated part; this
++            //  override stays so the placement is reproducible run to run.)
++            if (const char* v = std::getenv("DS4_POOL_GB")) {
++                const double gb = std::atof(v);
++                if (gb > 0) {
++                    std::fprintf(stderr, "ds4: CUDA%zu pool budget %.1f GB (DS4_POOL_GB; HIP reported %.1f GB free)\n",
++                                 i, gb, (double) d.free0 / 1e9);
++                    d.free0 = (size_t) (gb * 1e9);
++                }
++            }
+         }
+         // the groups' width: o.tp, less while the experts' blocks do not split in it (a member takes n_ff / tp of each
+         // expert: the down's inputs in whole blocks - a GGUF's 256-value types split n_ff 2304 in 1, 3 or 9 parts)

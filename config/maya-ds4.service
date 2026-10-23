@@ -1,0 +1,49 @@
+[Unit]
+Description=Maya DS4 - DeepSeek-V4.1-Flash-1017 (Maya-S) local inference server
+Documentation=file:///home/rj/.local/opt/maya-ds4/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rj
+Group=rj
+WorkingDirectory=/home/rj/.local/opt/project-maya-trial/upstream-update-20261020/source
+Environment=HOME=/home/rj
+Environment=PATH=/home/rj/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+# keep earlier turns' reasoning in the prompt so a turn continues the previous state: without it the
+# reference encoder rewrites the history every turn and neither prefix reuse nor the kept conversations
+# (MAYA_DS4_SLOT_KEEP) can hit - every turn then re-reads its whole prompt (measured: 19.3 s -> 2.7 s)
+Environment=MAYA_DS4_KEEP_THINKING=1
+
+# The engine pins host staging buffers for the expert DMA (GBs of flow rings and bounce buffers,
+# not MBs) and, on this APU, pinned host memory comes out of the same GTT window as the GPU pool.
+# Unlimited is the safe setting. Measured 2026-10-20: HIP's host allocations are NOT gated by
+# memlock (17 MiB pins fine under the default 8 MiB), so this is insurance rather than the fix -
+# the real ceiling is the GTT window, which DS4_POOL_GB and DS4_RING_MB keep under.
+LimitMEMLOCK=infinity
+
+# Loading reads ~108 GB of experts ahead and fills the GPU pool (DS4_POOL_GB=50): give it
+# time, and count its memory so the journal shows what it holds.
+TimeoutStartSec=infinity
+MemoryAccounting=yes
+# The pool is anonymous memory and cannot be reclaimed; the page cache beside it can. Hold the
+# service high enough that the kernel reclaims cache rather than reaching for the desktop.
+MemoryHigh=108G
+
+# The engine exits non-zero if the GPU pool or a shard is unusable; retry, but do not
+# hammer a broken install.
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=120
+KillMode=mixed
+
+ExecStart=/home/rj/.local/opt/maya-ds4/venv/bin/python serve/server.py \
+    --engine strata \
+    --config /home/rj/.local/opt/maya-ds4/ds4-config.json \
+    --host 127.0.0.1 \
+    --port 17866
+
+[Install]
+WantedBy=multi-user.target

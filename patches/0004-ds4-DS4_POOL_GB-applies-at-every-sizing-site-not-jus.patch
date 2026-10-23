@@ -1,0 +1,121 @@
+From 3e804a698c781c0f38e6d73d93f1b3476e041bc9 Mon Sep 17 00:00:00 2001
+From: OpenCode <rj@precisionailabs.com>
+Date: Tue, 20 Oct 2026 20:03:05 -0400
+Subject: [PATCH 4/9] ds4: DS4_POOL_GB applies at every sizing site, not just
+ the first measurement
+
+The budget was set once, on the device's first cudaMemGetInfo, but place_experts
+re-measures free memory after the vision tower and the per-group split measures it
+again per group - so the override was overwritten and the pool was sized from HIP
+once more: on 2026-10-20 20:58 the same flags that had produced a 38 GB pool
+produced a 114 GB one (10058 of 15744 experts), which left MemAvailable at 1.7 GB
+on a 128 GB box and reset the page cache to 3.4 GB.
+
+All six measuring sites now go through pool_budget().
+
+(cherry picked from commit 0663409d715ce34249ef870adf90237c6cce9554)
+(cherry picked from commit ebd4986b4e57a9a2c18f23e7f97b4595504ce1f5)
+(cherry picked from commit f37437e57105007641fd49c6f72d7a0d200c0410)
+---
+ src/ds4/ds4_model.cu | 39 ++++++++++++++++++++++++++-------------
+ 1 file changed, 26 insertions(+), 13 deletions(-)
+
+diff --git a/src/ds4/ds4_model.cu b/src/ds4/ds4_model.cu
+index f7c99cc..e7a3f55 100644
+--- a/src/ds4/ds4_model.cu
++++ b/src/ds4/ds4_model.cu
+@@ -1688,6 +1688,23 @@ struct Model::Impl {
+         const char* v = std::getenv(k);
+         return v != nullptr ? std::atoi(v) != 0 : devs.size() == 1;
+     }
++    // the budget a device's GPU pool and, from it, the read-ahead are sized from: DS4_POOL_GB when set, else what HIP
++    // measured. An APU's hipMemGetInfo reports the GTT pool rather than what the host can actually give and swings
++    // per process - 51 GB and 125 GB for the same process on this 128 GB Strix Halo, minutes apart - so the same
++    // flags sized a 22.9 GB pool one run and a 114 GB pool the next, one 10x slower to decode and the other leaving
++    // 1.7 GB for the whole desktop. Every site that (re)measures free memory for sizing goes through here.
++    static size_t pool_budget(size_t measured) {
++        static const char* const v = std::getenv("DS4_POOL_GB");
++        static const double gb = v != nullptr ? std::atof(v) : 0.0;
++        if (gb <= 0) return measured;
++        static bool said = false;
++        if (!said) {
++            said = true;   // (the first measurement of the run: what HIP claimed before the budget replaced it)
++            std::fprintf(stderr, "ds4: pool budget %.1f GB (DS4_POOL_GB; HIP reported %.1f GB free)\n", gb,
++                         (double) measured / 1e9);
++        }
++        return (size_t) (gb * 1e9);
++    }
+     // VRAM slot s of layer l, member x's part of it: u bytes a slot in its own allocation, the tail's xstep apart
+     static uint8_t* sat(const Layer& l, const Layer& x, int s, size_t u) {
+         if (!l.maddr.empty()) return l.maddr[(size_t) s];   // (a mixed layer: slot s = expert s, in its class's arena)
+@@ -2313,19 +2330,7 @@ struct Model::Impl {
+                 return false;
+             }
+             CK(mem_info(&d.free0, &d.total));
+-            // (an APU: HIP's free swings with the host's page cache - 48 GB and 120 GB for the same process on a
+-            //  128 GB Strix Halo, minutes apart - so the GPU pool and the read-ahead it sizes are not reproducible.
+-            //  DS4_POOL_GB pins the budget the pool is sized from; it is what the experts, the weights and their
+-            //  caches may take together, on this device.  Upstream's mem_info() measures the dedicated part; this
+-            //  override stays so the placement is reproducible run to run.)
+-            if (const char* v = std::getenv("DS4_POOL_GB")) {
+-                const double gb = std::atof(v);
+-                if (gb > 0) {
+-                    std::fprintf(stderr, "ds4: CUDA%zu pool budget %.1f GB (DS4_POOL_GB; HIP reported %.1f GB free)\n",
+-                                 i, gb, (double) d.free0 / 1e9);
+-                    d.free0 = (size_t) (gb * 1e9);
+-                }
+-            }
++            d.free0 = pool_budget(d.free0);
+         }
+         // the groups' width: o.tp, less while the experts' blocks do not split in it (a member takes n_ff / tp of each
+         // expert: the down's inputs in whole blocks - a GGUF's 256-value types split n_ff 2304 in 1, 3 or 9 parts)
+@@ -2953,6 +2958,7 @@ struct Model::Impl {
+                 cudaSetDevice(d.id);
+                 size_t fr = 0, tot = 0;
+                 CK(mem_info(&fr, &tot));
++                fr = pool_budget(fr);
+                 room += std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
+             }
+             for (const Layer& l : L) all += (double) l.blob * l.n_exp;
+@@ -4265,6 +4271,7 @@ struct Model::Impl {
+             cudaSetDevice(d.id);
+             size_t fr = 0, tot = 0;
+             CK(mem_info(&fr, &tot));
++            fr = pool_budget(fr);   // (DS4_POOL_GB: the one budget every sizing site uses)
+             const double room_e = std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
+             const size_t need = lay_chunk(c, chunk, nullptr, 2);
+             if (!mixed && room_e >= 2.0 * (double) need) continue;   // (the chunk default's bound: at most half the room)
+@@ -4296,6 +4303,9 @@ struct Model::Impl {
+                 cudaSetDevice(devs[(size_t) m].id);
+                 size_t fr = 0, tot = 0;
+                 CK(mem_info(&fr, &tot));
++                // (DS4_POOL_GB: the one budget every sizing site uses - v1.1.22 sizes each group member from
++                //  its own measurement, so the pin goes here, before the member's room is pushed)
++                fr = pool_budget(fr);
+                 mroom.push_back(std::max(0.0, ((double) fr - (double) ((size_t) o.reserve_mib << 20))) * o.vram_experts);
+                 charged = charged || commit_charged(devs[(size_t) m]);
+             }
+@@ -5128,6 +5138,7 @@ struct Model::Impl {
+             size_t fr = 0, tot = 0;
+             cudaSetDevice(d.id);
+             mem_info(&fr, &tot);
++            fr = pool_budget(fr);   // (DS4_POOL_GB: the one budget every sizing site uses)
+             const size_t gsz = groups.empty() ? 1 : groups[(size_t) d.grp].mem.size();
+             char tp[64] = "";
+             if (gsz > 1) std::snprintf(tp, sizeof tp, " (tensor parallel %zu, part %d)", gsz, d.mi);
+@@ -5488,6 +5499,7 @@ struct Model::Impl {
+         img_tok = tok;
+         CK(cudaSetDevice(d.id));
+         CK(mem_info(&d.free0, &d.total));   // (the split sees what the tower left)
++        d.free0 = pool_budget(d.free0);
+         if (o.verbose)
+             std::fprintf(stderr, "ds4: vision tower (%d blocks) on CUDA%d: %.0f MiB, up to %d patches, %.1f s\n",
+                          vg.layers, d.id, (double) vt.device_bytes() / (1 << 20), vt.max_patches(),
+@@ -7022,6 +7034,7 @@ struct Model::Impl {
+             CK(cudaSetDevice(d.id));
+             size_t fr = 0, tot = 0;
+             CK(mem_info(&fr, &tot));
++            fr = pool_budget(fr);   // (DS4_POOL_GB: the one budget every sizing site uses)
+             const double room = std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
+             if (exp_b <= room) continue;   // (every expert of its layers fits)
+             if (ln_force.empty() && pcie::cal_get(ln_file, lane_dev_key((int) di) + " | lane") == "off") continue;
